@@ -1319,8 +1319,8 @@ class ChildProcess extends EventEmitter {
         onDisconnect: has_ipc ? ok => this.#onDisconnect(ok) : undefined,
         serialization,
         argv0: spawnargs[0],
-        uid: options.uid || undefined,
-        gid: options.gid || undefined,
+        uid: options.uid || -1,
+        gid: options.gid || -1,
         windowsHide: !!options.windowsHide,
         windowsVerbatimArguments: !!options.windowsVerbatimArguments,
       });
