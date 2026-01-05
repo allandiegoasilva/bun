@@ -15,19 +15,17 @@ DEFINE_NATIVE_MODULE(NodeProcess)
     Bun::Process* process = globalObject->processObject();
     if (!process->staticPropertiesReified()) {
         process->reifyAllStaticProperties(globalObject);
-        if (scope.exception()) [[unlikely]]
-            return;
+        RETURN_IF_EXCEPTION(scope, );
     }
 
-    PropertyNameArray properties(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude);
+    PropertyNameArrayBuilder properties(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude);
     process->getPropertyNames(globalObject, properties, DontEnumPropertiesMode::Exclude);
-    if (scope.exception()) [[unlikely]]
-        return;
+    RETURN_IF_EXCEPTION(scope, );
 
     exportNames.append(vm.propertyNames->defaultKeyword);
     exportValues.append(process);
 
-    for (auto& entry : properties) {
+    for (auto& entry : properties.releaseData()->propertyNameVector()) {
         if (entry == vm.propertyNames->defaultKeyword) {
             // skip because it's already on the default
             // export (the Process object itself)

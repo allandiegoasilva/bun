@@ -1,5 +1,5 @@
 #!/bin/sh
-# Version: 13
+# Version: 26
 
 # A script that installs the dependencies needed to build and test Bun.
 # This should work on macOS and Linux with a POSIX shell.
@@ -26,8 +26,11 @@ error() {
 }
 
 execute() {
-	print "$ $@" >&2
-	if ! "$@"; then
+	local opts=$-
+	set -x
+	"$@"
+	{ local status=$?; set +x "$opts"; } 2> /dev/null
+	if [ "$status" -ne 0 ]; then
 		error "Command failed: $@"
 	fi
 }
@@ -189,15 +192,26 @@ download_file() {
 	file_tmp_dir="$(create_tmp_directory)"
 	file_tmp_path="$file_tmp_dir/$(basename "$file_url")"
 
-	fetch "$file_url" >"$file_tmp_path"
+	fetch "$file_url" > "$file_tmp_path"
 	grant_to_user "$file_tmp_path"
 
 	print "$file_tmp_path"
 }
 
+# path=$(download_and_verify_file URL sha256)
+download_and_verify_file() {
+	file_url="$1"
+	hash="$2"
+
+	path=$(download_file "$file_url")
+	execute sh -c 'echo "'"$hash  $path"'" | sha256sum -c -' >/dev/null 2>&1
+
+	print "$path"
+}
+
 append_to_profile() {
 	content="$1"
-	profiles=".profile .zprofile .bash_profile .bashrc .zshrc"
+	profiles=".profile .zprofile .bash_profile .bashrc .zshrc .cshrc"
 	for profile in $profiles; do
 		for profile_path in "$current_home/$profile" "$home/$profile"; do
 			if [ "$ci" = "1" ] || [ -f "$profile_path" ]; then
@@ -261,10 +275,10 @@ check_operating_system() {
 
 	os="$("$uname" -s)"
 	case "$os" in
-	Linux*)
+	Linux)
 		os="linux"
 		;;
-	Darwin*)
+	Darwin)
 		os="darwin"
 		;;
 	*)
@@ -400,7 +414,7 @@ check_package_manager() {
 		pm="brew"
 		;;
 	linux)
-		if [ -f "$(which apt)" ]; then
+		if [ -f "$(which apt-get)" ]; then
 			pm="apt"
 		elif [ -f "$(which dnf)" ]; then
 			pm="dnf"
@@ -464,16 +478,17 @@ check_user() {
 }
 
 check_ulimit() {
+	if ! [ "$os" = "linux" ]; then
+		return
+	fi
 	if ! [ "$ci" = "1" ]; then
 		return
 	fi
 
 	print "Checking ulimits..."
 	systemd_conf="/etc/systemd/system.conf"
-	if [ -f "$systemd_conf" ]; then
-		limits_conf="/etc/security/limits.d/99-unlimited.conf"
-		create_file "$limits_conf"
-	fi
+	limits_conf="/etc/security/limits.d/99-unlimited.conf"
+	create_file "$limits_conf"
 
 	limits="core data fsize memlock nofile rss stack cpu nproc as locks sigpending msgqueue"
 	for limit in $limits; do
@@ -495,6 +510,10 @@ check_ulimit() {
 		fi
 
 		if [ -f "$systemd_conf" ]; then
+			# in systemd's configuration you need to say "infinity" when you mean "unlimited"
+			if [ "$limit_value" = "unlimited" ]; then
+				limit_value="infinity"
+			fi
 			append_file "$systemd_conf" "DefaultLimit$limit_upper=$limit_value"
 		fi
 	done
@@ -549,7 +568,7 @@ check_ulimit() {
 package_manager() {
 	case "$pm" in
 	apt)
-		execute_sudo apt "$@"
+		execute_sudo apt-get "$@"
 		;;
 	dnf)
 		case "$distro" in
@@ -571,6 +590,9 @@ package_manager() {
 		;;
 	brew)
 		execute_as_user brew "$@"
+		;;
+	pkg)
+		execute_sudo pkg "$@"
 		;;
 	*)
 		error "Unsupported package manager: $pm"
@@ -598,6 +620,7 @@ install_packages() {
 		package_manager install \
 			--yes \
 			--no-install-recommends \
+			--fix-missing \
 			"$@"
 		;;
 	dnf)
@@ -627,6 +650,9 @@ install_packages() {
 			--no-interactive \
 			--no-progress \
 			"$@"
+		;;
+	pkg)
+		package_manager install "$@"
 		;;
 	*)
 		error "Unsupported package manager: $pm"
@@ -662,18 +688,70 @@ install_brew() {
 install_common_software() {
 	case "$pm" in
 	apt)
+		# software-properties-common is not available in Debian Trixie
+		if [ "$distro" = "debian" ] && [ "$release" = "13" ]; then
+			install_packages \
+				apt-transport-https
+		else
+			install_packages \
+				apt-transport-https \
+				software-properties-common
+		fi
+		# https://packages.debian.org
+		# https://packages.ubuntu.com
 		install_packages \
-			apt-transport-https \
-			software-properties-common
+			bash \
+			ca-certificates \
+			curl \
+			htop \
+			gnupg \
+			git \
+			unzip \
+			wget \
+			libc6-dbg
 		;;
 	dnf)
+		# https://packages.fedoraproject.org
 		install_packages \
+			bash \
+			ca-certificates \
+			curl \
+			htop \
+			gnupg \
+			git \
+			unzip \
+			wget \
 			dnf-plugins-core
+		;;
+	apk)
+		# https://pkgs.alpinelinux.org/packages
+		install_packages \
+			bash \
+			ca-certificates \
+			curl \
+			htop \
+			gnupg \
+			git \
+			unzip \
+			wget \
+		;;
+	pkg)
+		# https://www.freshports.org
+		install_packages \
+			shells/bash \
+			ftp/curl \
+			sysutils/htop \
+			security/gnupg \
+			devel/git \
+			archivers/unzip \
+			ftp/wget \
+			editors/vim \
+			sysutils/neofetch \
 		;;
 	esac
 
 	case "$distro" in
-	amzn)
+	amzn | alpine)
 		install_packages \
 			tar
 		;;
@@ -693,16 +771,6 @@ install_common_software() {
 		execute "$crb" enable
 	fi
 
-	install_packages \
-		bash \
-		ca-certificates \
-		curl \
-		htop \
-		gnupg \
-		git \
-		unzip \
-		wget
-
 	install_rosetta
 	install_nodejs
 	install_bun
@@ -719,27 +787,118 @@ nodejs_version() {
 }
 
 install_nodejs() {
-	case "$pm" in
-	dnf | yum)
-		bash="$(require bash)"
-		script=$(download_file "https://rpm.nodesource.com/setup_$(nodejs_version).x")
-		execute_sudo "$bash" "$script"
+	# Download Node.js directly from nodejs.org
+	nodejs_version="$(nodejs_version_exact)"
+
+	# Determine platform name for Node.js download
+	case "$os" in
+	darwin)
+		nodejs_platform="darwin"
 		;;
-	apt)
-		bash="$(require bash)"
-		script="$(download_file "https://deb.nodesource.com/setup_$(nodejs_version).x")"
-		execute_sudo "$bash" "$script"
+	linux)
+		nodejs_platform="linux"
+		;;
+	*)
+		error "Unsupported OS for Node.js download: $os"
 		;;
 	esac
 
-	case "$pm" in
-	apk)
-		install_packages nodejs npm
+	# Determine architecture name for Node.js download
+	case "$arch" in
+	x64)
+		nodejs_arch="x64"
+		;;
+	aarch64)
+		nodejs_arch="arm64"
 		;;
 	*)
-		install_packages nodejs
+		error "Unsupported architecture for Node.js download: $arch"
 		;;
 	esac
+
+	case "$abi" in
+	musl)
+		nodejs_mirror="https://bun-nodejs-release.s3.us-west-1.amazonaws.com"
+		nodejs_foldername="node-v$nodejs_version-$nodejs_platform-$nodejs_arch-musl"
+		;;
+	*)
+		nodejs_mirror="https://nodejs.org/dist"
+		nodejs_foldername="node-v$nodejs_version-$nodejs_platform-$nodejs_arch"
+		;;
+	esac
+
+	# Download Node.js binary archive
+	nodejs_url="$nodejs_mirror/v$nodejs_version/$nodejs_foldername.tar.gz"
+	nodejs_tar="$(download_file "$nodejs_url")"
+	nodejs_extract_dir="$(dirname "$nodejs_tar")"
+
+	# Extract Node.js
+	execute tar -xzf "$nodejs_tar" -C "$nodejs_extract_dir"
+
+	# Install Node.js binaries to system
+	nodejs_dir="$nodejs_extract_dir/$nodejs_foldername"
+
+	# Copy bin files preserving symlinks
+	for file in "$nodejs_dir/bin/"*; do
+		filename="$(basename "$file")"
+		if [ -L "$file" ]; then
+			# Get the symlink target
+			target="$(readlink "$file")"
+			# The symlinks are relative (like ../lib/node_modules/npm/bin/npm-cli.js)
+			# and will work correctly from /usr/local/bin since we're copying
+			# node_modules to /usr/local/lib/node_modules
+			execute_sudo ln -sf "$target" "/usr/local/bin/$filename"
+		elif [ -f "$file" ]; then
+			# Copy regular files
+			execute_sudo cp -f "$file" "/usr/local/bin/$filename"
+			execute_sudo chmod +x "/usr/local/bin/$filename"
+		fi
+	done
+
+	# Copy node_modules directory to lib
+	if [ -d "$nodejs_dir/lib/node_modules" ]; then
+		execute_sudo mkdir -p "/usr/local/lib"
+		execute_sudo cp -Rf "$nodejs_dir/lib/node_modules" "/usr/local/lib/"
+	fi
+
+	# Copy include files if they exist
+	if [ -d "$nodejs_dir/include" ]; then
+		execute_sudo mkdir -p "/usr/local/include"
+		execute_sudo cp -Rf "$nodejs_dir/include/node" "/usr/local/include/"
+	fi
+
+	# Copy share files if they exist (man pages, etc.)
+	if [ -d "$nodejs_dir/share" ]; then
+		execute_sudo mkdir -p "/usr/local/share"
+		# Copy only node-specific directories
+		for sharedir in "$nodejs_dir/share/"*; do
+			if [ -d "$sharedir" ]; then
+				dirname="$(basename "$sharedir")"
+				execute_sudo cp -Rf "$sharedir" "/usr/local/share/"
+			fi
+		done
+	fi
+
+	# Ensure /usr/local/bin is in PATH
+	if ! echo "$PATH" | grep -q "/usr/local/bin"; then
+		print "Adding /usr/local/bin to PATH"
+		append_to_profile 'export PATH="/usr/local/bin:$PATH"'
+		export PATH="/usr/local/bin:$PATH"
+	fi
+
+	# Verify Node.js installation
+	if ! command -v node >/dev/null 2>&1; then
+		error "Node.js installation failed: 'node' command not found in PATH"
+	fi
+
+	installed_version="$(node --version 2>/dev/null || echo "unknown")"
+	expected_version="v$nodejs_version"
+
+	if [ "$installed_version" != "$expected_version" ]; then
+		error "Node.js installation failed: expected version $expected_version but got $installed_version. Please check your PATH and try running 'which node' to debug."
+	fi
+
+	print "Node.js $installed_version installed successfully"
 
 	# Ensure that Node.js headers are always pre-downloaded so that we don't rely on node-gyp
 	install_nodejs_headers
@@ -752,7 +911,7 @@ install_nodejs_headers() {
 	execute tar -xzf "$nodejs_headers_tar" -C "$nodejs_headers_dir"
 
 	nodejs_headers_include="$nodejs_headers_dir/node-v$nodejs_version/include"
-	execute_sudo cp -R "$nodejs_headers_include/" "/usr"
+	execute_sudo cp -R "$nodejs_headers_include" "/usr/local/"
 
 	# Also install to node-gyp cache locations for different node-gyp versions
 	# This ensures node-gyp finds headers without downloading them
@@ -794,7 +953,7 @@ setup_node_gyp_cache() {
 }
 
 bun_version_exact() {
-	print "1.2.17"
+	print "1.3.1"
 }
 
 install_bun() {
@@ -873,6 +1032,7 @@ install_build_essentials() {
 			xz-utils \
 			pkg-config \
 			golang
+		install_packages apache2-utils
 		;;
 	dnf | yum)
 		install_packages \
@@ -900,6 +1060,7 @@ install_build_essentials() {
 			ninja \
 			go \
 			xz
+		install_packages apache2-utils
 		;;
 	esac
 
@@ -909,19 +1070,23 @@ install_build_essentials() {
 		;;
 	esac
 
-	install_packages \
-		make \
-		python3 \
-		libtool \
-		ruby \
-		perl
+	case "$os" in
+		linux)
+			install_packages \
+				make \
+				python3 \
+				libtool \
+				ruby \
+				perl \
+			;;
+	esac
 
 	install_cmake
 	install_llvm
 	install_osxcross
 	install_gcc
-	install_ccache
 	install_rust
+	install_ccache
 	install_docker
 }
 
@@ -936,31 +1101,40 @@ llvm_version() {
 install_llvm() {
 	case "$pm" in
 	apt)
-		bash="$(require bash)"
-		llvm_script="$(download_file "https://apt.llvm.org/llvm.sh")"
-		execute_sudo "$bash" "$llvm_script" "$(llvm_version)" all
+		# Debian 13 (Trixie) has LLVM 19 natively, and apt.llvm.org doesn't have a trixie repo
+		if [ "$distro" = "debian" ]; then
+			install_packages \
+				"llvm-$(llvm_version)" \
+				"clang-$(llvm_version)" \
+				"lld-$(llvm_version)" \
+				"llvm-$(llvm_version)-dev" \
+				"llvm-$(llvm_version)-tools" \
+				"libclang-rt-$(llvm_version)-dev"
+		else
+			bash="$(require bash)"
+			llvm_script="$(download_file "https://apt.llvm.org/llvm.sh")"
+			execute_sudo "$bash" "$llvm_script" "$(llvm_version)" all
 
-		# Install llvm-symbolizer explicitly to ensure it's available for ASAN
-		install_packages "llvm-$(llvm_version)-tools"
+			# Install llvm-symbolizer explicitly to ensure it's available for ASAN
+			install_packages "llvm-$(llvm_version)-tools"
+		fi
 		;;
 	brew)
 		install_packages "llvm@$(llvm_version)"
 		;;
 	apk)
-		# alpine doesn't have a lld19 package on 3.21 atm so use bare one for now
 		install_packages \
 			"llvm$(llvm_version)" \
 			"clang$(llvm_version)" \
 			"scudo-malloc" \
-			"lld" \
+			"lld$(llvm_version)" \
 			"llvm$(llvm_version)-dev" # Ensures llvm-symbolizer is installed
 		;;
 	esac
 }
 
 install_gcc() {
-	if ! [ "$os" = "linux" ] || ! [ "$distro" = "ubuntu" ] || [ -z "$gcc_version" ]
-	then
+	if ! [ "$os" = "linux" ] || ! [ "$distro" = "ubuntu" ] || [ -z "$gcc_version" ]; then
 		return
 	fi
 
@@ -1034,31 +1208,37 @@ install_gcc() {
 
 install_ccache() {
 	case "$pm" in
-	apt | apk | brew)
+	apt)
+		install_packages ccache
+		;;
+	brew)
+		install_packages ccache
+		;;
+	apk)
+		install_packages ccache
+		;;
+	dnf|yum)
+		install_packages ccache
+		;;
+	zypper)
 		install_packages ccache
 		;;
 	esac
 }
 
 install_rust() {
-	case "$pm" in
-	apk)
-		install_packages \
-			rust \
-			cargo
-		;;
-	*)
-		rust_home="/opt/rust"
-		create_directory "$rust_home"
-		append_to_profile "export RUSTUP_HOME=$rust_home"
-		append_to_profile "export CARGO_HOME=$rust_home"
+	rust_home="/opt/rust"
+	create_directory "$rust_home"
+	append_to_profile "export RUSTUP_HOME=$rust_home"
+	append_to_profile "export CARGO_HOME=$rust_home"
 
-		sh="$(require sh)"
-		rustup_script=$(download_file "https://sh.rustup.rs")
-		execute "$sh" -lc "$rustup_script -y --no-modify-path"
-		append_to_path "$rust_home/bin"
-		;;
-	esac
+	sh="$(require sh)"
+	rustup_script=$(download_file "https://sh.rustup.rs")
+	execute "$sh" -lc "$rustup_script -y --no-modify-path"
+	append_to_path "$rust_home/bin"
+
+	# Ensure all rustup files are accessible (for CI builds where different users run builds)
+	grant_to_user "$rust_home"
 
 	case "$osxcross" in
 	1)
@@ -1076,13 +1256,18 @@ install_docker() {
 			package_manager install docker --cask
 		fi
 		;;
+	pkg)
+		install_packages \
+			sysutils/docker \
+			sysutils/docker-compose \
+		;;
 	*)
 		case "$distro-$release" in
 		amzn-2 | amzn-1)
 			execute_sudo amazon-linux-extras install docker
 			;;
 		amzn-* | alpine-*)
-			install_packages docker
+			install_packages docker docker-cli-compose
 			;;
 		*)
 			sh="$(require sh)"
@@ -1097,10 +1282,17 @@ install_docker() {
 	if [ -f "$systemctl" ]; then
 		execute_sudo "$systemctl" enable docker
 	fi
+	if [ "$os" = "linux" ] && [ "$distro" = "alpine" ]; then
+		execute doas rc-update add docker default
+		execute doas rc-service docker start
+	fi
 
 	getent="$(which getent)"
 	if [ -n "$("$getent" group docker)" ]; then
 		usermod="$(which usermod)"
+		if [ -z "$usermod" ]; then
+			usermod="$(sudo which usermod)"
+		fi
 		if [ -f "$usermod" ]; then
 			execute_sudo "$usermod" -aG docker "$user"
 		fi
@@ -1167,6 +1359,10 @@ install_tailscale() {
 }
 
 install_fuse_python() {
+	if ! [ "$os" = "linux" ]; then
+		return
+	fi
+
 	# only linux needs this
 	case "$pm" in
 	apk)
@@ -1196,7 +1392,7 @@ install_fuse_python() {
 }
 
 create_buildkite_user() {
-	if ! [ "$ci" = "1" ] || ! [ "$os" = "linux" ]; then
+	if ! [ "$ci" = "1" ]; then
 		return
 	fi
 
@@ -1248,6 +1444,27 @@ create_buildkite_user() {
 	for file in $buildkite_files; do
 		create_file "$file"
 	done
+
+	# The following is necessary to configure buildkite to use a stable
+	# checkout directory for ccache to be effective.
+	local opts=$-
+	set -ef
+
+	# I do not want to use create_file because it creates directories with 777
+	# permissions and files with 664 permissions. This is dumb, for obvious
+	# reasons.
+	local hook_dir=${home}/hooks
+	mkdir -p -m 755 "${hook_dir}"
+	cat << EOF > "${hook_dir}/environment"
+#!/bin/sh
+set -efu
+
+export BUILDKITE_BUILD_CHECKOUT_PATH=${home}/build
+EOF
+	execute_sudo chmod +x "${hook_dir}/environment"
+	execute_sudo chown -R "$user:$group" "$hook_dir"
+
+	set +ef -"$opts"
 }
 
 install_buildkite() {
@@ -1255,7 +1472,7 @@ install_buildkite() {
 		return
 	fi
 
-	buildkite_version="3.87.0"
+	buildkite_version="3.114.0"
 	case "$arch" in
 	aarch64)
 		buildkite_arch="arm64"
@@ -1281,10 +1498,10 @@ install_chromium() {
 	apk)
 		install_packages \
 			chromium \
-      nss \
-      freetype \
-      harfbuzz \
-      ttf-freefont
+			nss \
+			freetype \
+			harfbuzz \
+			ttf-freefont
 		;;
 	apt)
 		install_packages \
@@ -1352,12 +1569,78 @@ install_chromium() {
 			xorg-x11-fonts-Type1 \
 			xorg-x11-utils
 		;;
+	pkg)
+		install_packages \
+			www/chromium \
+		;;
 	esac
 
 	case "$distro" in
 	amzn)
 		install_packages \
 			mesa-libgbm
+		;;
+	esac
+}
+
+install_age() {
+	age_version="1.2.1"
+	case "$os" in
+	linux)
+		case "$arch" in
+		x64)
+			age_arch="amd64"
+			age_hash="7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50"
+			;;
+		aarch64)
+			age_arch="arm64"
+			age_hash="57fd79a7ece5fe501f351b9dd51a82fbee1ea8db65a8839db17f5c080245e99f"
+			;;
+		*)
+			error "Unsupported platform: $os-$arch"
+			;;
+		esac
+		;;
+	*)
+		error "Unsupported platform: $os-$arch"
+		;;
+	esac
+
+	age_tarball="$(download_and_verify_file https://github.com/FiloSottile/age/releases/download/v$age_version/age-v$age_version-$os-$age_arch.tar.gz "$age_hash")"
+	age_extract_dir="$(create_tmp_directory)"
+	execute tar -C "$age_extract_dir" -zxf "$age_tarball" age/age
+	move_to_bin "$age_extract_dir/age/age"
+}
+
+configure_core_dumps() {
+	case "$os" in
+	linux)
+		# set up a directory that the test runner will look in after running tests
+		cores_dir="/var/bun-cores-$distro-$release-$arch"
+		sysctl_file="/etc/sysctl.d/local.conf"
+		create_directory "$cores_dir"
+		# ensure core_pattern will point there
+		# %e = executable filename
+		# %p = pid
+		append_file "$sysctl_file" "kernel.core_pattern = $cores_dir/%e-%p.core"
+
+		# disable apport.service if it exists since it will override the core_pattern
+		if which systemctl >/dev/null; then
+			if systemctl list-unit-files apport.service >/dev/null; then
+				execute_sudo "$systemctl" disable --now apport.service
+			fi
+		fi
+
+		# load the new configuration (ignore permission errors)
+		execute_sudo sysctl -p "$sysctl_file"
+
+		# ensure that a regular user will be able to run sysctl
+		if [ -d /sbin ]; then
+			append_to_path /sbin
+		fi
+
+		# install gdb for backtraces
+		install_packages gdb
 		;;
 	esac
 }
@@ -1375,6 +1658,17 @@ clean_system() {
 	done
 }
 
+ensure_no_tmpfs() {
+	if ! [ "$os" = "linux" ]; then
+		return
+	fi
+	if ! ( [ "$distro" = "ubuntu" ] || [ "$distro" = "debian" ] ); then
+		return
+	fi
+
+	execute_sudo systemctl mask tmp.mount
+}
+
 main() {
 	check_features "$@"
 	check_operating_system
@@ -1387,7 +1681,12 @@ main() {
 	install_build_essentials
 	install_chromium
 	install_fuse_python
+	install_age
+	if [ "${BUN_NO_CORE_DUMP:-0}" != "1" ]; then
+		configure_core_dumps
+	fi
 	clean_system
+	ensure_no_tmpfs
 }
 
 main "$@"

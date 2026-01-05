@@ -1,12 +1,15 @@
+.claude/settings.local.json
 .DS_Store
 .env
 .envrc
 .eslintcache
+.gdb_history
 .idea
 .next
 .ninja_deps
 .ninja_log
 .npm
+.npmrc
 .npm.gz
 .parcel-cache
 .swcrc
@@ -36,6 +39,7 @@
 *.out.refresh.js
 *.pdb
 *.sqlite
+*.swp
 *.tmp
 *.trace
 *.wat
@@ -184,3 +188,8 @@ codegen-for-zig-team.tar.gz
 scratch*.{js,ts,tsx,cjs,mjs}
 
 *.bun-build
+
+scripts/lldb-inline
+
+# We regenerate these in all the build scripts
+cmake/sources/*.txt

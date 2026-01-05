@@ -97,33 +97,28 @@ NodeVMSourceTextModule* NodeVMSourceTextModule::create(VM& vm, JSGlobalObject* g
     WTF::String sourceText = sourceTextValue.toWTFString(globalObject);
     RETURN_IF_EXCEPTION(scope, nullptr);
 
-    Ref<StringSourceProvider> sourceProvider = StringSourceProvider::create(WTFMove(sourceText), sourceOrigin, String {}, SourceTaintedOrigin::Untainted,
+    Ref<StringSourceProvider> sourceProvider = StringSourceProvider::create(WTF::move(sourceText), sourceOrigin, String {}, SourceTaintedOrigin::Untainted,
         TextPosition { OrdinalNumber::fromZeroBasedInt(lineOffset), OrdinalNumber::fromZeroBasedInt(columnOffset) }, SourceProviderSourceType::Module);
 
-    SourceCode sourceCode(WTFMove(sourceProvider), lineOffset, columnOffset);
+    SourceCode sourceCode(WTF::move(sourceProvider), lineOffset, columnOffset);
 
     auto* zigGlobalObject = defaultGlobalObject(globalObject);
     WTF::String identifier = identifierValue.toWTFString(globalObject);
     RETURN_IF_EXCEPTION(scope, nullptr);
-    NodeVMSourceTextModule* ptr = new (NotNull, allocateCell<NodeVMSourceTextModule>(vm)) NodeVMSourceTextModule(vm, zigGlobalObject->NodeVMSourceTextModuleStructure(), WTFMove(identifier), contextValue, WTFMove(sourceCode), moduleWrapper);
+    NodeVMSourceTextModule* ptr = new (NotNull, allocateCell<NodeVMSourceTextModule>(vm)) NodeVMSourceTextModule(
+        vm, zigGlobalObject->NodeVMSourceTextModuleStructure(), WTF::move(identifier), contextValue,
+        WTF::move(sourceCode), moduleWrapper, initializeImportMeta);
     RETURN_IF_EXCEPTION(scope, nullptr);
     ptr->finishCreation(vm);
-
-    if (!initializeImportMeta.isUndefined()) {
-        ptr->m_initializeImportMeta.set(vm, ptr, initializeImportMeta);
-    }
 
     if (cachedData.isEmpty()) {
         return ptr;
     }
 
     ModuleProgramExecutable* executable = ModuleProgramExecutable::tryCreate(globalObject, ptr->sourceCode());
+    RETURN_IF_EXCEPTION(scope, {});
     if (!executable) {
-        // If an exception is already being thrown, don't throw another one.
-        // ModuleProgramExecutable::tryCreate() sometimes throws on failure, but sometimes it doesn't.
-        if (!scope.exception()) {
-            throwSyntaxError(globalObject, scope, "Failed to create cached executable"_s);
-        }
+        throwSyntaxError(globalObject, scope, "Failed to create cached executable"_s);
         return nullptr;
     }
 
@@ -132,7 +127,7 @@ NodeVMSourceTextModule* NodeVMSourceTextModule::create(VM& vm, JSGlobalObject* g
     SourceCodeKey key(ptr->sourceCode(), {}, SourceCodeType::ProgramType, lexicallyScopedFeatures, JSParserScriptMode::Classic, DerivedContextType::None, EvalContextType::None, false, {}, std::nullopt);
     Ref<CachedBytecode> cachedBytecode = CachedBytecode::create(std::span(cachedData), nullptr, {});
     RETURN_IF_EXCEPTION(scope, nullptr);
-    UnlinkedModuleProgramCodeBlock* unlinkedBlock = decodeCodeBlock<UnlinkedModuleProgramCodeBlock>(vm, key, WTFMove(cachedBytecode));
+    UnlinkedModuleProgramCodeBlock* unlinkedBlock = decodeCodeBlock<UnlinkedModuleProgramCodeBlock>(vm, key, WTF::move(cachedBytecode));
     RETURN_IF_EXCEPTION(scope, nullptr);
 
     if (unlinkedBlock) {
@@ -208,9 +203,7 @@ JSValue NodeVMSourceTextModule::createModuleRecord(JSGlobalObject* globalObject)
     const auto& requests = moduleRecord->requestedModules();
 
     if (requests.isEmpty()) {
-        JSArray* requestsArray = constructEmptyArray(globalObject, nullptr, 0);
-        RETURN_IF_EXCEPTION(scope, {});
-        return requestsArray;
+        RELEASE_AND_RETURN(scope, constructEmptyArray(globalObject, nullptr, 0));
     }
 
     JSArray* requestsArray = constructEmptyArray(globalObject, nullptr, requests.size());
@@ -281,7 +274,7 @@ JSValue NodeVMSourceTextModule::createModuleRecord(JSGlobalObject* globalObject)
                 break;
             }
 
-            attributeMap.set("type"_s, WTFMove(attributesTypeString));
+            attributeMap.set("type"_s, WTF::move(attributesTypeString));
             attributesObject->putDirect(vm, JSC::Identifier::fromString(vm, "type"_s), attributesType);
 
             if (const String& hostDefinedImportType = request.m_attributes->hostDefinedImportType(); !hostDefinedImportType.isEmpty()) {
@@ -298,7 +291,7 @@ JSValue NodeVMSourceTextModule::createModuleRecord(JSGlobalObject* globalObject)
         }
 
         requestObject->putDirect(vm, attributesIdentifier, attributesObject);
-        addModuleRequest({ WTF::String(*request.m_specifier), WTFMove(attributeMap) });
+        addModuleRequest({ WTF::String(*request.m_specifier), WTF::move(attributeMap) });
         requestsArray->putDirectIndex(globalObject, i, requestObject);
     }
 
@@ -354,14 +347,13 @@ JSValue NodeVMSourceTextModule::link(JSGlobalObject* globalObject, JSArray* spec
 
             record->setImportedModule(globalObject, Identifier::fromString(vm, specifier), resolvedRecord);
             RETURN_IF_EXCEPTION(scope, {});
-            m_resolveCache.set(WTFMove(specifier), WriteBarrier<JSObject> { vm, this, moduleNative });
+            m_resolveCache.set(WTF::move(specifier), WriteBarrier<JSObject> { vm, this, moduleNative });
             RETURN_IF_EXCEPTION(scope, {});
         }
     }
 
     NodeVMGlobalObject* nodeVmGlobalObject = getGlobalObjectFromContext(globalObject, m_context.get(), false);
     RETURN_IF_EXCEPTION(scope, {});
-
     if (nodeVmGlobalObject) {
         globalObject = nodeVmGlobalObject;
     }
@@ -392,9 +384,7 @@ RefPtr<CachedBytecode> NodeVMSourceTextModule::bytecode(JSGlobalObject* globalOb
             ModuleProgramExecutable* executable = ModuleProgramExecutable::tryCreate(globalObject, m_sourceCode);
             RETURN_IF_EXCEPTION(scope, nullptr);
             if (!executable) {
-                if (!scope.exception()) {
-                    throwSyntaxError(globalObject, scope, "Failed to create cached executable"_s);
-                }
+                throwSyntaxError(globalObject, scope, "Failed to create cached executable"_s);
                 return nullptr;
             }
             m_cachedExecutable.set(vm, this, executable);
@@ -408,7 +398,7 @@ RefPtr<CachedBytecode> NodeVMSourceTextModule::bytecode(JSGlobalObject* globalOb
 
 JSUint8Array* NodeVMSourceTextModule::cachedData(JSGlobalObject* globalObject)
 {
-    VM& vm = globalObject->vm();
+    auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     if (!m_cachedBytecodeBuffer) {
@@ -425,20 +415,21 @@ JSUint8Array* NodeVMSourceTextModule::cachedData(JSGlobalObject* globalObject)
 
 void NodeVMSourceTextModule::initializeImportMeta(JSGlobalObject* globalObject)
 {
-    if (!m_initializeImportMeta) {
+    if (!m_initializeImportMeta || !m_initializeImportMeta.get().isCallable()) {
         return;
     }
 
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
     JSModuleEnvironment* moduleEnvironment = m_moduleRecord->moduleEnvironmentMayBeNull();
     ASSERT(moduleEnvironment != nullptr);
 
-    VM& vm = globalObject->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-
     JSValue metaValue = moduleEnvironment->get(globalObject, globalObject->vm().propertyNames->builtinNames().metaPrivateName());
+    scope.assertNoExceptionExceptTermination();
     RETURN_IF_EXCEPTION(scope, );
-    ASSERT(metaValue);
-    ASSERT(metaValue.isObject());
+    if (!metaValue || !metaValue.isObject()) {
+        return;
+    }
 
     CallData callData = JSC::getCallData(m_initializeImportMeta.get());
 
@@ -447,7 +438,7 @@ void NodeVMSourceTextModule::initializeImportMeta(JSGlobalObject* globalObject)
     args.append(m_moduleWrapper.get());
 
     JSC::call(globalObject, m_initializeImportMeta.get(), callData, jsUndefined(), args);
-    RETURN_IF_EXCEPTION(scope, );
+    scope.release();
 }
 
 JSObject* NodeVMSourceTextModule::createPrototype(VM& vm, JSGlobalObject* globalObject)

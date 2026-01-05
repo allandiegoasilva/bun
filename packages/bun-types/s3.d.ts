@@ -282,6 +282,24 @@ declare module "bun" {
     type?: string;
 
     /**
+     * The Content-Disposition header value.
+     * Controls how the file is presented when downloaded.
+     *
+     * @example
+     *    // Setting attachment disposition with filename
+     *     const file = s3.file("report.pdf", {
+     *       contentDisposition: "attachment; filename=\"quarterly-report.pdf\""
+     *     });
+     *
+     * @example
+     *    // Setting inline disposition
+     *     await s3.write("image.png", imageData, {
+     *       contentDisposition: "inline"
+     *     });
+     */
+    contentDisposition?: string | undefined;
+
+    /**
      * By default, Amazon S3 uses the STANDARD Storage Class to store newly created objects.
      *
      * @example
@@ -487,8 +505,8 @@ declare module "bun" {
      *       // Process text chunk by chunk
      *     }
      */
-    readonly readable: ReadableStream;
-    stream(): ReadableStream;
+    readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+    stream(): ReadableStream<Uint8Array<ArrayBuffer>>;
 
     /**
      * The name or path of the file in the bucket.

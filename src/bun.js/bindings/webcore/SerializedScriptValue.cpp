@@ -26,7 +26,7 @@
 
 #include "config.h"
 #include "SerializedScriptValue.h"
-
+#include "BunString.h"
 // #include "BlobRegistry.h"
 // #include "ByteArrayPixelBuffer.h"
 #include "CryptoKeyAES.h"
@@ -114,6 +114,8 @@
 #include "JSPrivateKeyObject.h"
 #include "CryptoKeyType.h"
 #include "JSNodePerformanceHooksHistogram.h"
+#include <limits>
+#include <algorithm>
 
 #if USE(CG)
 #include <CoreGraphics/CoreGraphics.h>
@@ -890,7 +892,7 @@ public:
         WasmMemoryHandleArray& wasmMemoryHandles,
 #endif
         Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers,
-        SerializationForStorage forStorage, SerializationForTransfer forTransfer)
+        SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer)
     {
         CloneSerializer serializer(lexicalGlobalObject, messagePorts, arrayBuffers,
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
@@ -992,7 +994,7 @@ private:
         WasmModuleArray& wasmModules,
         WasmMemoryHandleArray& wasmMemoryHandles,
 #endif
-        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForTransfer forTransfer)
+        Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers, SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer)
         : CloneBase(lexicalGlobalObject)
         , m_buffer(out)
         , m_emptyIdentifier(Identifier::fromString(lexicalGlobalObject->vm(), emptyString()))
@@ -1530,7 +1532,7 @@ private:
         auto index = m_serializedVideoFrames.find(videoFrame.ptr());
         if (index == notFound) {
             index = m_serializedVideoChunks.size();
-            m_serializedVideoFrames.append(WTFMove(videoFrame));
+            m_serializedVideoFrames.append(WTF::move(videoFrame));
         }
         write(WebCodecsVideoFrameTag);
         write(static_cast<uint32_t>(index));
@@ -1575,6 +1577,8 @@ private:
         }
 
         VM& vm = m_lexicalGlobalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+
         if (isArray(value))
             return false;
 
@@ -1667,7 +1671,6 @@ private:
             }
             if (auto* errorInstance = jsDynamicCast<ErrorInstance*>(obj)) {
                 auto& vm = m_lexicalGlobalObject->vm();
-                auto scope = DECLARE_THROW_SCOPE(vm);
                 auto errorTypeValue = errorInstance->get(m_lexicalGlobalObject, vm.propertyNames->name);
                 RETURN_IF_EXCEPTION(scope, false);
                 auto errorTypeString = errorTypeValue.toWTFString(m_lexicalGlobalObject);
@@ -1676,7 +1679,7 @@ private:
                 String message;
                 PropertyDescriptor messageDescriptor;
                 if (errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->message, messageDescriptor) && messageDescriptor.isDataDescriptor()) {
-                    EXCEPTION_ASSERT(!scope.exception());
+                    scope.assertNoException();
                     message = messageDescriptor.value().toWTFString(m_lexicalGlobalObject);
                 }
                 RETURN_IF_EXCEPTION(scope, false);
@@ -1684,7 +1687,7 @@ private:
                 unsigned line = 0;
                 PropertyDescriptor lineDescriptor;
                 if (errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->line, lineDescriptor) && lineDescriptor.isDataDescriptor()) {
-                    EXCEPTION_ASSERT(!scope.exception());
+                    scope.assertNoException();
                     line = lineDescriptor.value().toNumber(m_lexicalGlobalObject);
                 }
                 RETURN_IF_EXCEPTION(scope, false);
@@ -1692,7 +1695,7 @@ private:
                 unsigned column = 0;
                 PropertyDescriptor columnDescriptor;
                 if (errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->column, columnDescriptor) && columnDescriptor.isDataDescriptor()) {
-                    EXCEPTION_ASSERT(!scope.exception());
+                    scope.assertNoException();
                     column = columnDescriptor.value().toNumber(m_lexicalGlobalObject);
                 }
                 RETURN_IF_EXCEPTION(scope, false);
@@ -1700,7 +1703,7 @@ private:
                 String sourceURL;
                 PropertyDescriptor sourceURLDescriptor;
                 if (errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->sourceURL, sourceURLDescriptor) && sourceURLDescriptor.isDataDescriptor()) {
-                    EXCEPTION_ASSERT(!scope.exception());
+                    scope.assertNoException();
                     sourceURL = sourceURLDescriptor.value().toWTFString(m_lexicalGlobalObject);
                 }
                 RETURN_IF_EXCEPTION(scope, false);
@@ -1708,7 +1711,7 @@ private:
                 String stack;
                 PropertyDescriptor stackDescriptor;
                 if (errorInstance->getOwnPropertyDescriptor(m_lexicalGlobalObject, vm.propertyNames->stack, stackDescriptor) && stackDescriptor.isDataDescriptor()) {
-                    EXCEPTION_ASSERT(!scope.exception());
+                    scope.assertNoException();
                     stack = stackDescriptor.value().toWTFString(m_lexicalGlobalObject);
                 }
                 RETURN_IF_EXCEPTION(scope, false);
@@ -1757,7 +1760,7 @@ private:
                     ArrayBufferContents contents;
                     if (arrayBuffer->shareWith(contents)) {
                         write(SharedArrayBufferTag);
-                        m_sharedBuffers.append(WTFMove(contents));
+                        m_sharedBuffers.append(WTF::move(contents));
                         write(index);
                         return true;
                     }
@@ -1783,6 +1786,7 @@ private:
                 if (checkForDuplicate(obj))
                     return true;
                 bool success = dumpArrayBufferView(obj, code);
+                RETURN_IF_EXCEPTION(scope, false);
                 recordObject(obj);
                 return success;
             }
@@ -1946,15 +1950,19 @@ private:
 #endif
 
             // write bun types
-            if (auto _cloneable = StructuredCloneableSerialize::fromJS(value)) {
-                if (m_forTransfer == SerializationForTransfer::Yes && !SerializedScriptValue::isTransferable(m_lexicalGlobalObject, value)) {
+            auto _cloneable = StructuredCloneableSerialize::fromJS(value);
+            if (_cloneable) {
+                auto cloneable = _cloneable.value();
+                const bool isTransferCompatible = m_forTransfer == SerializationForCrossProcessTransfer::Yes ? cloneable.isForTransfer : true;
+                const bool isStorageCompatible = m_forStorage == SerializationForStorage::Yes ? cloneable.isForStorage : true;
+                if (!isTransferCompatible || !isStorageCompatible) {
                     write(ObjectTag);
                     write(TerminatorTag);
                     return true;
                 }
-                StructuredCloneableSerialize cloneable = WTFMove(_cloneable.value());
-                write(cloneable.tag);
-                cloneable.write(this, m_lexicalGlobalObject);
+                StructuredCloneableSerialize to_write = WTF::move(_cloneable.value());
+                write(to_write.tag);
+                to_write.write(this, m_lexicalGlobalObject);
                 return true;
             }
 
@@ -1997,7 +2005,6 @@ private:
                     return true;
                 }
                 case CryptoKeyType::Public: {
-                    auto scope = DECLARE_THROW_SCOPE(vm);
                     auto* pkey = handle.asymmetricKey().get();
 
                     BIO* bio = BIO_new(BIO_s_mem());
@@ -2015,7 +2022,6 @@ private:
                     return true;
                 }
                 case CryptoKeyType::Private: {
-                    auto scope = DECLARE_THROW_SCOPE(vm);
                     auto* pkey = handle.asymmetricKey().get();
 
                     BIO* bio = BIO_new(BIO_s_mem());
@@ -2559,7 +2565,7 @@ private:
     Vector<RefPtr<WebCodecsVideoFrame>>& m_serializedVideoFrames;
 #endif
     SerializationForStorage m_forStorage;
-    SerializationForTransfer m_forTransfer;
+    SerializationForCrossProcessTransfer m_forTransfer;
 };
 
 SYSV_ABI void SerializedScriptValue::writeBytesForBun(CloneSerializer* ctx, const uint8_t* data, uint32_t size)
@@ -2572,7 +2578,7 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
     VM& vm = m_lexicalGlobalObject->vm();
     Vector<uint32_t, 16> indexStack;
     Vector<uint32_t, 16> lengthStack;
-    Vector<PropertyNameArray, 16> propertyStack;
+    Vector<PropertyNameArrayBuilder, 16> propertyStack;
     Vector<JSObject*, 32> inputObjectStack;
     Vector<JSMapIterator*, 4> mapIteratorStack;
     Vector<JSSetIterator*, 4> setIteratorStack;
@@ -2606,10 +2612,9 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 indexStack.removeLast();
                 lengthStack.removeLast();
 
-                propertyStack.append(PropertyNameArray(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
+                propertyStack.append(PropertyNameArrayBuilder(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
                 array->getOwnNonIndexPropertyNames(m_lexicalGlobalObject, propertyStack.last(), DontEnumPropertiesMode::Exclude);
-                if (scope.exception()) [[unlikely]]
-                    return SerializationReturnCode::ExistingExceptionError;
+                RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
                 if (propertyStack.last().size()) {
                     write(NonIndexPropertiesTag);
                     indexStack.append(0);
@@ -2622,8 +2627,7 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 break;
             }
             inValue = array->getDirectIndex(m_lexicalGlobalObject, index);
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
             if (!inValue) {
                 indexStack.last()++;
                 goto arrayStartVisitMember;
@@ -2631,7 +2635,9 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
 
             write(index);
             auto terminalCode = SerializationReturnCode::SuccessfullyCompleted;
-            if (dumpIfTerminal(inValue, terminalCode)) {
+            auto dumped = dumpIfTerminal(inValue, terminalCode);
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
+            if (dumped) {
                 if (terminalCode != SerializationReturnCode::SuccessfullyCompleted)
                     return terminalCode;
                 indexStack.last()++;
@@ -2660,17 +2666,16 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 return SerializationReturnCode::DataCloneError;
             inputObjectStack.append(inObject);
             indexStack.append(0);
-            propertyStack.append(PropertyNameArray(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
+            propertyStack.append(PropertyNameArrayBuilder(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
             inObject->methodTable()->getOwnPropertyNames(inObject, m_lexicalGlobalObject, propertyStack.last(), DontEnumPropertiesMode::Exclude);
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
         }
         objectStartVisitMember:
             [[fallthrough]];
         case ObjectStartVisitMember: {
             JSObject* object = inputObjectStack.last();
             uint32_t index = indexStack.last();
-            PropertyNameArray& properties = propertyStack.last();
+            PropertyNameArrayBuilder& properties = propertyStack.last();
             if (index == properties.size()) {
                 endObject();
                 inputObjectStack.removeLast();
@@ -2679,8 +2684,7 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 break;
             }
             inValue = getProperty(object, properties[index]);
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
 
             if (!inValue) {
                 // Property was removed during serialisation
@@ -2689,11 +2693,12 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
             }
             write(properties[index]);
 
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
 
             auto terminalCode = SerializationReturnCode::SuccessfullyCompleted;
-            if (!dumpIfTerminal(inValue, terminalCode)) {
+            auto dumped = dumpIfTerminal(inValue, terminalCode);
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
+            if (!dumped) {
                 stateStack.append(ObjectEndVisitMember);
                 goto stateUnknown;
             }
@@ -2702,8 +2707,7 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
             [[fallthrough]];
         }
         case ObjectEndVisitMember: {
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
 
             indexStack.last()++;
             goto objectStartVisitMember;
@@ -2715,9 +2719,8 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
             JSMap* inMap = jsCast<JSMap*>(inValue);
             if (!startMap(inMap))
                 break;
-            JSMapIterator* iterator = JSMapIterator::create(m_lexicalGlobalObject, m_lexicalGlobalObject->mapIteratorStructure(), inMap, IterationKind::Entries);
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            JSMapIterator* iterator = JSMapIterator::create(vm, m_lexicalGlobalObject->mapIteratorStructure(), inMap, IterationKind::Entries);
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
             m_gcBuffer.appendWithCrashOnOverflow(inMap);
             m_gcBuffer.appendWithCrashOnOverflow(iterator);
             mapIteratorStack.append(iterator);
@@ -2732,10 +2735,9 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 mapIteratorStack.removeLast();
                 JSObject* object = inputObjectStack.last();
                 ASSERT(jsDynamicCast<JSMap*>(object));
-                propertyStack.append(PropertyNameArray(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
+                propertyStack.append(PropertyNameArrayBuilder(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
                 object->methodTable()->getOwnPropertyNames(object, m_lexicalGlobalObject, propertyStack.last(), DontEnumPropertiesMode::Exclude);
-                if (scope.exception()) [[unlikely]]
-                    return SerializationReturnCode::ExistingExceptionError;
+                RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
                 write(NonMapPropertiesTag);
                 indexStack.append(0);
                 goto objectStartVisitMember;
@@ -2763,9 +2765,8 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
             JSSet* inSet = jsCast<JSSet*>(inValue);
             if (!startSet(inSet))
                 break;
-            JSSetIterator* iterator = JSSetIterator::create(m_lexicalGlobalObject, m_lexicalGlobalObject->setIteratorStructure(), inSet, IterationKind::Keys);
-            if (scope.exception()) [[unlikely]]
-                return SerializationReturnCode::ExistingExceptionError;
+            JSSetIterator* iterator = JSSetIterator::create(vm, m_lexicalGlobalObject->setIteratorStructure(), inSet, IterationKind::Keys);
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
             m_gcBuffer.appendWithCrashOnOverflow(inSet);
             m_gcBuffer.appendWithCrashOnOverflow(iterator);
             setIteratorStack.append(iterator);
@@ -2780,10 +2781,9 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
                 setIteratorStack.removeLast();
                 JSObject* object = inputObjectStack.last();
                 ASSERT(jsDynamicCast<JSSet*>(object));
-                propertyStack.append(PropertyNameArray(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
+                propertyStack.append(PropertyNameArrayBuilder(vm, PropertyNameMode::Strings, PrivateSymbolMode::Exclude));
                 object->methodTable()->getOwnPropertyNames(object, m_lexicalGlobalObject, propertyStack.last(), DontEnumPropertiesMode::Exclude);
-                if (scope.exception()) [[unlikely]]
-                    return SerializationReturnCode::ExistingExceptionError;
+                RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
                 write(NonSetPropertiesTag);
                 indexStack.append(0);
                 goto objectStartVisitMember;
@@ -2799,7 +2799,9 @@ SerializationReturnCode CloneSerializer::serialize(JSValue in)
         stateUnknown:
         case StateUnknown: {
             auto terminalCode = SerializationReturnCode::SuccessfullyCompleted;
-            if (dumpIfTerminal(inValue, terminalCode)) {
+            auto dumped = dumpIfTerminal(inValue, terminalCode);
+            RETURN_IF_EXCEPTION(scope, SerializationReturnCode::ExistingExceptionError);
+            if (dumped) {
                 if (terminalCode != SerializationReturnCode::SuccessfullyCompleted)
                     return terminalCode;
                 break;
@@ -2876,14 +2878,14 @@ public:
     //     {
     //         if (!buffer.size())
     //             return std::make_pair(jsNull(), SerializationReturnCode::UnspecifiedError);
-    //         CloneDeserializer deserializer(lexicalGlobalObject, globalObject, messagePorts, arrayBufferContentsArray, buffer, blobURLs, blobFilePaths, sharedBuffers, WTFMove(backingStores)
+    //         CloneDeserializer deserializer(lexicalGlobalObject, globalObject, messagePorts, arrayBufferContentsArray, buffer, blobURLs, blobFilePaths, sharedBuffers, WTF::move(backingStores)
     // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
     //                                                                                                                                                                       ,
-    //             WTFMove(detachedOffscreenCanvases)
+    //             WTF::move(detachedOffscreenCanvases)
     // #endif
     // #if ENABLE(WEB_RTC)
     //                 ,
-    //             WTFMove(detachedRTCDataChannels)
+    //             WTF::move(detachedRTCDataChannels)
     // #endif
     // #if ENABLE(WEBASSEMBLY)
     //                 ,
@@ -2891,7 +2893,7 @@ public:
     // #endif
     // #if ENABLE(WEB_CODECS)
     //             ,
-    //             WTFMove(serializedVideoChunks), WTFMove(serializedVideoFrames)
+    //             WTF::move(serializedVideoChunks), WTF::move(serializedVideoFrames)
     // #endif
     //         );
     //         if (!deserializer.isValid())
@@ -2925,11 +2927,11 @@ public:
         CloneDeserializer deserializer(lexicalGlobalObject, globalObject, messagePorts, arrayBufferContentsArray, std::span<uint8_t> { buffer.begin(), buffer.end() }, blobURLs, blobFilePaths, sharedBuffers
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
             ,
-            WTFMove(detachedOffscreenCanvases)
+            WTF::move(detachedOffscreenCanvases)
 #endif
 #if ENABLE(WEB_RTC)
                 ,
-            WTFMove(detachedRTCDataChannels)
+            WTF::move(detachedRTCDataChannels)
 #endif
 #if ENABLE(WEBASSEMBLY)
                 ,
@@ -2937,7 +2939,7 @@ public:
 #endif
 #if ENABLE(WEB_CODECS)
             ,
-            WTFMove(serializedVideoChunks), WTFMove(serializedVideoFrames)
+            WTF::move(serializedVideoChunks), WTF::move(serializedVideoFrames)
 #endif
         );
         if (!deserializer.isValid())
@@ -2972,7 +2974,7 @@ private:
             return m_jsString;
         }
         const String& string() { return m_string; }
-        String takeString() { return WTFMove(m_string); }
+        String takeString() { return WTF::move(m_string); }
 
     private:
         String m_string;
@@ -3031,14 +3033,14 @@ private:
     //         , m_messagePorts(messagePorts)
     //         , m_arrayBufferContents(arrayBufferContents)
     //         , m_arrayBuffers(arrayBufferContents ? arrayBufferContents->size() : 0)
-    //         , m_backingStores(WTFMove(backingStores))
+    //         , m_backingStores(WTF::move(backingStores))
     //         , m_imageBitmaps(m_backingStores.size())
     // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-    //         , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+    //         , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
     //         , m_offscreenCanvases(m_detachedOffscreenCanvases.size())
     // #endif
     // #if ENABLE(WEB_RTC)
-    //         , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+    //         , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
     //         , m_rtcDataChannels(m_detachedRTCDataChannels.size())
     // #endif
     // #if ENABLE(WEBASSEMBLY)
@@ -3046,9 +3048,9 @@ private:
     //         , m_wasmMemoryHandles(wasmMemoryHandles)
     // #endif
     // #if ENABLE(WEB_CODECS)
-    //         , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
+    //         , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
     //         , m_videoChunks(m_serializedVideoChunks.size())
-    //         , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+    //         , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
     //         , m_videoFrames(m_serializedVideoFrames.size())
     // #endif
     //     {
@@ -3085,11 +3087,11 @@ private:
         , m_arrayBufferContents(arrayBufferContents)
         , m_arrayBuffers(arrayBufferContents ? arrayBufferContents->size() : 0)
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-        , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+        , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
         , m_offscreenCanvases(m_detachedOffscreenCanvases.size())
 #endif
 #if ENABLE(WEB_RTC)
-        , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+        , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
         , m_rtcDataChannels(m_detachedRTCDataChannels.size())
 #endif
 #if ENABLE(WEBASSEMBLY)
@@ -3097,9 +3099,9 @@ private:
         , m_wasmMemoryHandles(wasmMemoryHandles)
 #endif
 #if ENABLE(WEB_CODECS)
-        , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
+        , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
         , m_videoChunks(m_serializedVideoChunks.size())
-        , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+        , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
         , m_videoFrames(m_serializedVideoFrames.size())
 #endif
     {
@@ -3138,14 +3140,14 @@ private:
     //         , m_blobURLs(blobURLs)
     //         , m_blobFilePaths(blobFilePaths)
     //         , m_sharedBuffers(sharedBuffers)
-    //         , m_backingStores(WTFMove(backingStores))
+    //         , m_backingStores(WTF::move(backingStores))
     //         , m_imageBitmaps(m_backingStores.size())
     // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-    //         , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+    //         , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
     //         , m_offscreenCanvases(m_detachedOffscreenCanvases.size())
     // #endif
     // #if ENABLE(WEB_RTC)
-    //         , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+    //         , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
     //         , m_rtcDataChannels(m_detachedRTCDataChannels.size())
     // #endif
     // #if ENABLE(WEBASSEMBLY)
@@ -3153,9 +3155,9 @@ private:
     //         , m_wasmMemoryHandles(wasmMemoryHandles)
     // #endif
     // #if ENABLE(WEB_CODECS)
-    //         , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
+    //         , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
     //         , m_videoChunks(m_serializedVideoChunks.size())
-    //         , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+    //         , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
     //         , m_videoFrames(m_serializedVideoFrames.size())
     // #endif
     //     {
@@ -3195,11 +3197,11 @@ private:
         , m_blobFilePaths(blobFilePaths)
         , m_sharedBuffers(sharedBuffers)
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-        , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+        , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
         , m_offscreenCanvases(m_detachedOffscreenCanvases.size())
 #endif
 #if ENABLE(WEB_RTC)
-        , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+        , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
         , m_rtcDataChannels(m_detachedRTCDataChannels.size())
 #endif
 #if ENABLE(WEBASSEMBLY)
@@ -3207,9 +3209,9 @@ private:
         , m_wasmMemoryHandles(wasmMemoryHandles)
 #endif
 #if ENABLE(WEB_CODECS)
-        , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
+        , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
         , m_videoChunks(m_serializedVideoChunks.size())
-        , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+        , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
         , m_videoFrames(m_serializedVideoFrames.size())
 #endif
     {
@@ -3390,7 +3392,7 @@ private:
         if (is8Bit) {
             if ((end - ptr) < static_cast<int>(length))
                 return false;
-            str = Identifier::fromString(vm, { reinterpret_cast<const LChar*>(ptr), length });
+            str = Identifier::fromString(vm, { reinterpret_cast<const Latin1Character*>(ptr), length });
             ptr += length;
             return true;
         }
@@ -3952,7 +3954,7 @@ private:
         CryptoAlgorithmIdentifier hash;
         if (!read(hash))
             return false;
-        result = CryptoKeyHMAC::importRaw(0, hash, WTFMove(keyData), extractable, usages);
+        result = CryptoKeyHMAC::importRaw(0, hash, WTF::move(keyData), extractable, usages);
         return true;
     }
 
@@ -3966,7 +3968,7 @@ private:
         Vector<uint8_t> keyData;
         if (!read(keyData))
             return false;
-        result = CryptoKeyAES::importRaw(algorithm, WTFMove(keyData), extractable, usages);
+        result = CryptoKeyAES::importRaw(algorithm, WTF::move(keyData), extractable, usages);
         return true;
     }
 
@@ -3997,7 +3999,7 @@ private:
         if (type == CryptoKeyAsymmetricTypeSubtag::Public) {
             auto keyData = CryptoKeyRSAComponents::createPublic(modulus, exponent);
             auto key = CryptoKeyRSA::create(algorithm, hash, isRestrictedToHash, *keyData, extractable, usages);
-            result = WTFMove(key);
+            result = WTF::move(key);
             return true;
         }
 
@@ -4012,7 +4014,7 @@ private:
         if (!primeCount) {
             auto keyData = CryptoKeyRSAComponents::createPrivate(modulus, exponent, privateExponent);
             auto key = CryptoKeyRSA::create(algorithm, hash, isRestrictedToHash, *keyData, extractable, usages);
-            result = WTFMove(key);
+            result = WTF::move(key);
             return true;
         }
 
@@ -4044,7 +4046,7 @@ private:
 
         auto keyData = CryptoKeyRSAComponents::createPrivateWithAdditionalData(modulus, exponent, privateExponent, firstPrimeInfo, secondPrimeInfo, otherPrimeInfos);
         auto key = CryptoKeyRSA::create(algorithm, hash, isRestrictedToHash, *keyData, extractable, usages);
-        result = WTFMove(key);
+        result = WTF::move(key);
         return true;
     }
 
@@ -4067,10 +4069,10 @@ private:
 
         switch (type) {
         case CryptoKeyAsymmetricTypeSubtag::Public:
-            result = CryptoKeyEC::importRaw(algorithm, curve->string(), WTFMove(keyData), extractable, usages);
+            result = CryptoKeyEC::importRaw(algorithm, curve->string(), WTF::move(keyData), extractable, usages);
             break;
         case CryptoKeyAsymmetricTypeSubtag::Private:
-            result = CryptoKeyEC::importPkcs8(algorithm, curve->string(), WTFMove(keyData), extractable, usages);
+            result = CryptoKeyEC::importPkcs8(algorithm, curve->string(), WTF::move(keyData), extractable, usages);
             break;
         }
 
@@ -4091,7 +4093,7 @@ private:
         if (!read(keyData))
             return false;
 
-        result = CryptoKeyOKP::importRaw(algorithm, namedCurve, WTFMove(keyData), extractable, usages);
+        result = CryptoKeyOKP::importRaw(algorithm, namedCurve, WTF::move(keyData), extractable, usages);
         return true;
     }
 
@@ -4103,7 +4105,7 @@ private:
         Vector<uint8_t> keyData;
         if (!read(keyData))
             return false;
-        result = CryptoKeyRaw::create(algorithm, WTFMove(keyData), usages);
+        result = CryptoKeyRaw::create(algorithm, WTF::move(keyData), usages);
         return true;
     }
 
@@ -4252,7 +4254,7 @@ private:
     //             return {};
 
     //         TransformationMatrix matrix(m11, m12, m21, m22, m41, m42);
-    //         return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), T::create(WTFMove(matrix), DOMMatrixReadOnly::Is2D::Yes));
+    //         return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), T::create(WTF::move(matrix), DOMMatrixReadOnly::Is2D::Yes));
     //     } else {
     //         double m11;
     //         if (!read(m11))
@@ -4304,7 +4306,7 @@ private:
     //             return {};
 
     //         TransformationMatrix matrix(m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44);
-    //         return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), T::create(WTFMove(matrix), DOMMatrixReadOnly::Is2D::No));
+    //         return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), T::create(WTF::move(matrix), DOMMatrixReadOnly::Is2D::No));
     //     }
     // }
 
@@ -4371,7 +4373,7 @@ private:
 
     //     if (!m_imageBitmaps[index]) {
     //         m_backingStores.at(index)->connect(*executionContext(m_lexicalGlobalObject));
-    //         m_imageBitmaps[index] = ImageBitmap::create(WTFMove(m_backingStores.at(index)));
+    //         m_imageBitmaps[index] = ImageBitmap::create(WTF::move(m_backingStores.at(index)));
     //     }
 
     //     auto bitmap = m_imageBitmaps[index].get();
@@ -4389,7 +4391,7 @@ private:
         }
 
         if (!m_offscreenCanvases[index])
-            m_offscreenCanvases[index] = OffscreenCanvas::create(*executionContext(m_lexicalGlobalObject), WTFMove(m_detachedOffscreenCanvases.at(index)));
+            m_offscreenCanvases[index] = OffscreenCanvas::create(*executionContext(m_lexicalGlobalObject), WTF::move(m_detachedOffscreenCanvases.at(index)));
 
         auto offscreenCanvas = m_offscreenCanvases[index].get();
         return getJSValue(offscreenCanvas);
@@ -4438,8 +4440,8 @@ private:
         if (!m_canCreateDOMObject)
             return constructEmptyObject(m_lexicalGlobalObject, m_globalObject->objectPrototype());
 
-        auto rtcCertificate = RTCCertificate::create(SecurityOrigin::createFromString(origin->string()), expires, WTFMove(fingerprints), certificate->takeString(), keyedMaterial->takeString());
-        return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), WTFMove(rtcCertificate));
+        auto rtcCertificate = RTCCertificate::create(SecurityOrigin::createFromString(origin->string()), expires, WTF::move(fingerprints), certificate->takeString(), keyedMaterial->takeString());
+        return toJSNewlyCreated(m_lexicalGlobalObject, jsCast<JSDOMGlobalObject*>(m_globalObject), WTF::move(rtcCertificate));
     }
 
     JSValue readRTCDataChannel()
@@ -4452,8 +4454,8 @@ private:
         }
 
         if (!m_rtcDataChannels[index]) {
-            auto detachedChannel = WTFMove(m_detachedRTCDataChannels.at(index));
-            m_rtcDataChannels[index] = RTCDataChannel::create(*executionContext(m_lexicalGlobalObject), detachedChannel->identifier, WTFMove(detachedChannel->label), WTFMove(detachedChannel->options), detachedChannel->state);
+            auto detachedChannel = WTF::move(m_detachedRTCDataChannels.at(index));
+            m_rtcDataChannels[index] = RTCDataChannel::create(*executionContext(m_lexicalGlobalObject), detachedChannel->identifier, WTF::move(detachedChannel->label), WTF::move(detachedChannel->options), detachedChannel->state);
         }
 
         return getJSValue(m_rtcDataChannels[index].get());
@@ -4485,7 +4487,7 @@ private:
         }
 
         if (!m_videoFrames[index])
-            m_videoFrames[index] = WebCodecsVideoFrame::create(*executionContext(m_lexicalGlobalObject), WTFMove(m_serializedVideoFrames.at(index)));
+            m_videoFrames[index] = WebCodecsVideoFrame::create(*executionContext(m_lexicalGlobalObject), WTF::move(m_serializedVideoFrames.at(index)));
 
         return getJSValue(m_videoFrames[index].get());
     }
@@ -4524,7 +4526,7 @@ private:
 
     //     buffer->putPixelBuffer(*pixelBuffer, { IntPoint::zero(), logicalSize });
 
-    //     auto bitmap = ImageBitmap::create(ImageBitmapBacking(WTFMove(buffer), OptionSet<SerializationState>::fromRaw(serializationState)));
+    //     auto bitmap = ImageBitmap::create(ImageBitmapBacking(WTF::move(buffer), OptionSet<SerializationState>::fromRaw(serializationState)));
     //     return getJSValue(bitmap);
     // }
 
@@ -4552,7 +4554,7 @@ private:
 
         auto cert_ptr = ncrypto::X509Pointer(cert);
         auto* domGlobalObject = defaultGlobalObject(m_globalObject);
-        auto* cert_obj = Bun::JSX509Certificate::create(m_lexicalGlobalObject->vm(), domGlobalObject->m_JSX509CertificateClassStructure.get(domGlobalObject), m_globalObject, WTFMove(cert_ptr));
+        auto* cert_obj = Bun::JSX509Certificate::create(m_lexicalGlobalObject->vm(), domGlobalObject->m_JSX509CertificateClassStructure.get(domGlobalObject), m_globalObject, WTF::move(cert_ptr));
         m_gcBuffer.appendWithCrashOnOverflow(cert_obj);
 
         return cert_obj;
@@ -4577,9 +4579,9 @@ private:
                 return JSValue();
             }
 
-            KeyObject keyObject = KeyObject::create(WTFMove(keyData));
+            KeyObject keyObject = KeyObject::create(WTF::move(keyData));
             Structure* structure = globalObject->m_JSSecretKeyObjectClassStructure.get(m_globalObject);
-            return JSSecretKeyObject::create(vm, structure, m_globalObject, WTFMove(keyObject));
+            return JSSecretKeyObject::create(vm, structure, m_globalObject, WTF::move(keyObject));
         }
         case CryptoKeyType::Public:
         case CryptoKeyType::Private: {
@@ -4603,7 +4605,7 @@ private:
                 }
                 auto keyObject = KeyObject::create(CryptoKeyType::Public, ncrypto::EVPKeyPointer(pkey));
                 Structure* structure = globalObject->m_JSPublicKeyObjectClassStructure.get(m_globalObject);
-                return JSPublicKeyObject::create(vm, structure, m_globalObject, WTFMove(keyObject));
+                return JSPublicKeyObject::create(vm, structure, m_globalObject, WTF::move(keyObject));
             }
 
             EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
@@ -4613,7 +4615,7 @@ private:
             }
             auto keyObject = KeyObject::create(CryptoKeyType::Private, ncrypto::EVPKeyPointer(pkey));
             Structure* structure = globalObject->m_JSPrivateKeyObjectClassStructure.get(m_globalObject);
-            return JSPrivateKeyObject::create(vm, structure, m_globalObject, WTFMove(keyObject));
+            return JSPrivateKeyObject::create(vm, structure, m_globalObject, WTF::move(keyObject));
         }
         }
     }
@@ -4822,7 +4824,7 @@ private:
         //     }
         //     if (!m_canCreateDOMObject)
         //         return jsNull();
-        //     return getJSValue(FileList::create(WTFMove(files)).get());
+        //     return getJSValue(FileList::create(WTF::move(files)).get());
         // }
         // case ImageDataTag: {
         //     uint32_t width;
@@ -4958,7 +4960,7 @@ private:
                 fail();
                 return JSValue();
             }
-            return ErrorInstance::create(m_lexicalGlobalObject, WTFMove(message), toErrorType(serializedErrorType), { line, column }, WTFMove(sourceURL), WTFMove(stackString));
+            return ErrorInstance::create(m_lexicalGlobalObject, WTF::move(message), toErrorType(serializedErrorType), { line, column }, WTF::move(sourceURL), WTF::move(stackString));
         }
         case ObjectReferenceTag: {
             auto index = readConstantPoolIndex(m_gcBuffer);
@@ -5027,10 +5029,10 @@ private:
                     fail();
                     return JSValue();
                 }
-                memory = Wasm::Memory::create(vm, contents.releaseNonNull(), WTFMove(handler));
+                memory = Wasm::Memory::create(contents.releaseNonNull(), WTF::move(handler));
             } else {
                 // zero size & max-size.
-                memory = Wasm::Memory::createZeroSized(vm, JSC::MemorySharingMode::Shared, WTFMove(handler));
+                memory = Wasm::Memory::createZeroSized(JSC::MemorySharingMode::Shared, WTF::move(handler));
             }
 
             result->adopt(memory.releaseNonNull());
@@ -5051,7 +5053,7 @@ private:
                 fail();
                 return JSValue();
             }
-            JSValue result = JSArrayBuffer::create(m_lexicalGlobalObject->vm(), structure, WTFMove(arrayBuffer));
+            JSValue result = JSArrayBuffer::create(m_lexicalGlobalObject->vm(), structure, WTF::move(arrayBuffer));
             m_gcBuffer.appendWithCrashOnOverflow(result);
             return result;
         }
@@ -5068,7 +5070,7 @@ private:
                 fail();
                 return JSValue();
             }
-            JSValue result = JSArrayBuffer::create(m_lexicalGlobalObject->vm(), structure, WTFMove(arrayBuffer));
+            JSValue result = JSArrayBuffer::create(m_lexicalGlobalObject->vm(), structure, WTF::move(arrayBuffer));
             m_gcBuffer.appendWithCrashOnOverflow(result);
             return result;
         }
@@ -5081,7 +5083,7 @@ private:
             }
 
             if (!m_arrayBuffers[index])
-                m_arrayBuffers[index] = ArrayBuffer::create(WTFMove(m_arrayBufferContents->at(index)));
+                m_arrayBuffers[index] = ArrayBuffer::create(WTF::move(m_arrayBufferContents->at(index)));
 
             return getJSValue(m_arrayBuffers[index].get());
         }
@@ -5097,7 +5099,7 @@ private:
             RELEASE_ASSERT(m_sharedBuffers->at(index));
             ArrayBufferContents arrayBufferContents;
             m_sharedBuffers->at(index).shareWith(arrayBufferContents);
-            auto buffer = ArrayBuffer::create(WTFMove(arrayBufferContents));
+            auto buffer = ArrayBuffer::create(WTF::move(arrayBufferContents));
             JSValue result = getJSValue(buffer.get());
             m_gcBuffer.appendWithCrashOnOverflow(result);
             return result;
@@ -5270,7 +5272,6 @@ DeserializationResult CloneDeserializer::deserialize()
         case ArrayStartState: {
             uint32_t length;
             if (!read(length)) {
-                fail();
                 goto error;
             }
             JSArray* outArray = constructEmptyArray(m_globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), length);
@@ -5284,7 +5285,6 @@ DeserializationResult CloneDeserializer::deserialize()
         case ArrayStartVisitMember: {
             uint32_t index;
             if (!read(index)) {
-                fail();
                 goto error;
             }
             if (index == TerminatorTag) {
@@ -5296,10 +5296,14 @@ DeserializationResult CloneDeserializer::deserialize()
                 goto objectStartVisitMember;
             }
 
-            if (JSValue terminal = readTerminal()) {
+            JSValue terminal = readTerminal();
+            if (scope.exception()) [[unlikely]]
+                goto error;
+            if (m_failed)
+                goto error;
+            if (terminal) {
                 putProperty(outputObjectStack.last(), index, terminal);
                 if (scope.exception()) [[unlikely]] {
-                    fail();
                     goto error;
                 }
                 goto arrayStartVisitMember;
@@ -5314,7 +5318,6 @@ DeserializationResult CloneDeserializer::deserialize()
             JSObject* outArray = outputObjectStack.last();
             putProperty(outArray, indexStack.last(), outValue);
             if (scope.exception()) [[unlikely]] {
-                fail();
                 goto error;
             }
             indexStack.removeLast();
@@ -5343,10 +5346,14 @@ DeserializationResult CloneDeserializer::deserialize()
                 break;
             }
 
-            if (JSValue terminal = readTerminal()) {
+            JSValue terminal = readTerminal();
+            if (scope.exception()) [[unlikely]]
+                goto error;
+            if (m_failed)
+                goto error;
+            if (terminal) {
                 putProperty(outputObjectStack.last(), cachedString->identifier(vm), terminal);
                 if (scope.exception()) [[unlikely]] {
-                    fail();
                     goto error;
                 }
                 goto objectStartVisitMember;
@@ -5386,7 +5393,6 @@ DeserializationResult CloneDeserializer::deserialize()
         case MapDataEndVisitValue: {
             mapStack.last()->set(m_lexicalGlobalObject, mapKeyStack.last(), outValue);
             if (scope.exception()) [[unlikely]] {
-                fail();
                 goto error;
             }
             mapKeyStack.removeLast();
@@ -5415,7 +5421,6 @@ DeserializationResult CloneDeserializer::deserialize()
             JSSet* set = setStack.last();
             set->add(m_lexicalGlobalObject, outValue);
             if (scope.exception()) [[unlikely]] {
-                fail();
                 goto error;
             }
             goto setDataStartVisitEntry;
@@ -5423,7 +5428,12 @@ DeserializationResult CloneDeserializer::deserialize()
 
         stateUnknown:
         case StateUnknown:
-            if (JSValue terminal = readTerminal()) {
+            JSValue terminal = readTerminal();
+            if (scope.exception()) [[unlikely]]
+                goto error;
+            if (m_failed)
+                goto error;
+            if (terminal) {
                 outValue = terminal;
                 break;
             }
@@ -5464,14 +5474,14 @@ SerializedScriptValue::SerializedScriptValue(Vector<uint8_t>&& buffer, std::uniq
     Vector<RefPtr<WebCodecsEncodedVideoChunkStorage>>&& serializedVideoChunks, Vector<WebCodecsVideoFrameData>&& serializedVideoFrames
 #endif
     )
-    : m_data(WTFMove(buffer))
-    , m_arrayBufferContentsArray(WTFMove(arrayBufferContentsArray))
+    : m_data(WTF::move(buffer))
+    , m_arrayBufferContentsArray(WTF::move(arrayBufferContentsArray))
 #if ENABLE(WEB_RTC)
-    , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+    , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
 #endif
 #if ENABLE(WEB_CODECS)
-    , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
-    , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+    , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
+    , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
 #endif
 {
     m_memoryCost = computeMemoryCost();
@@ -5495,25 +5505,25 @@ SerializedScriptValue::SerializedScriptValue(Vector<uint8_t>&& buffer, std::uniq
 //     Vector<RefPtr<WebCodecsEncodedVideoChunkStorage>>&& serializedVideoChunks, Vector<WebCodecsVideoFrameData>&& serializedVideoFrames
 // #endif
 //     )
-//     : m_data(WTFMove(buffer))
-//     , m_arrayBufferContentsArray(WTFMove(arrayBufferContentsArray))
-//     , m_sharedBufferContentsArray(WTFMove(sharedBufferContentsArray))
-//     , m_backingStores(WTFMove(backingStores))
+//     : m_data(WTF::move(buffer))
+//     , m_arrayBufferContentsArray(WTF::move(arrayBufferContentsArray))
+//     , m_sharedBufferContentsArray(WTF::move(sharedBufferContentsArray))
+//     , m_backingStores(WTF::move(backingStores))
 // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-//     , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+//     , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
 // #endif
 // #if ENABLE(WEB_RTC)
-//     , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+//     , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
 // #endif
 // #if ENABLE(WEBASSEMBLY)
-//     , m_wasmModulesArray(WTFMove(wasmModulesArray))
-//     , m_wasmMemoryHandlesArray(WTFMove(wasmMemoryHandlesArray))
+//     , m_wasmModulesArray(WTF::move(wasmModulesArray))
+//     , m_wasmMemoryHandlesArray(WTF::move(wasmMemoryHandlesArray))
 // #endif
 // #if ENABLE(WEB_CODECS)
-//     , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
-//     , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+//     , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
+//     , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
 // #endif
-//     , m_blobHandles(crossThreadCopy(WTFMove(blobHandles)))
+//     , m_blobHandles(crossThreadCopy(WTF::move(blobHandles)))
 // {
 //     m_memoryCost = computeMemoryCost();
 // }
@@ -5536,23 +5546,37 @@ SerializedScriptValue::SerializedScriptValue(Vector<uint8_t>&& buffer, std::uniq
     Vector<RefPtr<WebCodecsEncodedVideoChunkStorage>>&& serializedVideoChunks, Vector<WebCodecsVideoFrameData>&& serializedVideoFrames
 #endif
     )
-    : m_data(WTFMove(buffer))
-    , m_arrayBufferContentsArray(WTFMove(arrayBufferContentsArray))
-    , m_sharedBufferContentsArray(WTFMove(sharedBufferContentsArray))
+    : m_data(WTF::move(buffer))
+    , m_arrayBufferContentsArray(WTF::move(arrayBufferContentsArray))
+    , m_sharedBufferContentsArray(WTF::move(sharedBufferContentsArray))
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
-    , m_detachedOffscreenCanvases(WTFMove(detachedOffscreenCanvases))
+    , m_detachedOffscreenCanvases(WTF::move(detachedOffscreenCanvases))
 #endif
 #if ENABLE(WEB_RTC)
-    , m_detachedRTCDataChannels(WTFMove(detachedRTCDataChannels))
+    , m_detachedRTCDataChannels(WTF::move(detachedRTCDataChannels))
 #endif
 #if ENABLE(WEBASSEMBLY)
-    , m_wasmModulesArray(WTFMove(wasmModulesArray))
-    , m_wasmMemoryHandlesArray(WTFMove(wasmMemoryHandlesArray))
+    , m_wasmModulesArray(WTF::move(wasmModulesArray))
+    , m_wasmMemoryHandlesArray(WTF::move(wasmMemoryHandlesArray))
 #endif
 #if ENABLE(WEB_CODECS)
-    , m_serializedVideoChunks(WTFMove(serializedVideoChunks))
-    , m_serializedVideoFrames(WTFMove(serializedVideoFrames))
+    , m_serializedVideoChunks(WTF::move(serializedVideoChunks))
+    , m_serializedVideoFrames(WTF::move(serializedVideoFrames))
 #endif
+{
+    m_memoryCost = computeMemoryCost();
+}
+
+SerializedScriptValue::SerializedScriptValue(WTF::FixedVector<SimpleInMemoryPropertyTableEntry>&& object)
+    : m_simpleInMemoryPropertyTable(WTF::move(object))
+    , m_fastPath(FastPath::SimpleObject)
+{
+    m_memoryCost = computeMemoryCost();
+}
+
+SerializedScriptValue::SerializedScriptValue(const String& fastPathString)
+    : m_fastPathString(fastPathString)
+    , m_fastPath(FastPath::String)
 {
     m_memoryCost = computeMemoryCost();
 }
@@ -5607,6 +5631,32 @@ size_t SerializedScriptValue::computeMemoryCost() const
     // for (auto& handle : m_blobHandles)
     //     cost += handle.url().string().sizeInBytes();
 
+    // Account for fast path string memory usage
+    switch (m_fastPath) {
+    case FastPath::String:
+        ASSERT(m_simpleInMemoryPropertyTable.isEmpty());
+        cost += m_fastPathString.sizeInBytes();
+        break;
+    case FastPath::SimpleObject:
+        ASSERT(m_fastPathString.isEmpty());
+        cost += m_simpleInMemoryPropertyTable.byteSize();
+        // Add the memory cost of strings in the simple property table
+        for (const auto& entry : m_simpleInMemoryPropertyTable) {
+            // Add property name string cost
+            cost += entry.propertyName.sizeInBytes();
+
+            // Add value string cost if it's a string
+            if (std::holds_alternative<WTF::String>(entry.value)) {
+                const auto& str = std::get<WTF::String>(entry.value);
+                cost += str.sizeInBytes();
+            }
+        }
+
+        break;
+    case FastPath::None:
+        break;
+    }
+
     return cost;
 }
 
@@ -5641,13 +5691,13 @@ static void maybeThrowExceptionIfSerializationFailed(JSGlobalObject& lexicalGlob
         break;
     case SerializationReturnCode::StackOverflowError:
         throwException(&lexicalGlobalObject, scope, createStackOverflowError(&lexicalGlobalObject));
-        RELEASE_AND_RETURN(scope, );
+        break;
     case SerializationReturnCode::ValidationError:
         throwTypeError(&lexicalGlobalObject, scope, "Unable to deserialize data."_s);
-        RELEASE_AND_RETURN(scope, );
+        break;
     case SerializationReturnCode::DataCloneError:
         throwDataCloneError(lexicalGlobalObject, scope);
-        RELEASE_AND_RETURN(scope, );
+        break;
     case SerializationReturnCode::ExistingExceptionError:
     case SerializationReturnCode::UnspecifiedError:
         break;
@@ -5680,6 +5730,43 @@ static Exception exceptionForSerializationFailure(SerializationReturnCode code)
     return Exception { TypeError };
 }
 
+// This is based on `checkStrucureForClone`
+static bool isObjectFastPathCandidate(Structure* structure)
+{
+    static constexpr bool verbose = false;
+
+    if (structure->typeInfo().type() != FinalObjectType) {
+        dataLogLnIf(verbose, "target is not final object");
+        return false;
+    }
+
+    if (!structure->canAccessPropertiesQuicklyForEnumeration()) {
+        dataLogLnIf(verbose, "target cannot access properties quickly for enumeration");
+        return false;
+    }
+
+    if (hasIndexedProperties(structure->indexingType())) {
+        dataLogLnIf(verbose, "target has indexing mode");
+        return false;
+    }
+
+    if (structure->isBrandedStructure()) {
+        dataLogLnIf(verbose, "target has isBrandedStructure");
+        return false;
+    }
+
+    if (structure->hasAnyKindOfGetterSetterProperties()) {
+        dataLogLnIf(verbose, "target has any kind of getter setter properties");
+        return false;
+    }
+
+    if (structure->hasNonConfigurableProperties() || structure->hasNonEnumerableProperties()) {
+        dataLogLnIf(verbose, "target has non-configurable or non-enumerable properties");
+        return false;
+    }
+
+    return true;
+}
 // static bool containsDuplicates(const Vector<RefPtr<ImageBitmap>>& imageBitmaps)
 // {
 //     HashSet<ImageBitmap*> visited;
@@ -5720,7 +5807,7 @@ static bool canDetachRTCDataChannels(const Vector<Ref<RTCDataChannel>>& channels
 }
 #endif
 
-RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSC::JSGlobalObject& globalObject, JSC::JSValue value, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext serializationContext, SerializationForTransfer forTransfer)
+RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSC::JSGlobalObject& globalObject, JSC::JSValue value, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext serializationContext, SerializationForCrossProcessTransfer forTransfer)
 {
     Vector<RefPtr<MessagePort>> dummyPorts;
     auto result = create(globalObject, value, {}, dummyPorts, forStorage, throwExceptions, serializationContext, forTransfer);
@@ -5732,18 +5819,103 @@ RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSC::JSGlobalObject&
 
 // ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& globalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationContext serializationContext)
 // {
-//     return create(globalObject, value, WTFMove(transferList), messagePorts, forStorage, SerializationErrorMode::NonThrowing, serializationContext);
+//     return create(globalObject, value, WTF::move(transferList), messagePorts, forStorage, SerializationErrorMode::NonThrowing, serializationContext);
 // }
 
-ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& globalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationContext serializationContext, SerializationForTransfer forTransfer)
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& globalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationContext serializationContext, SerializationForCrossProcessTransfer forTransfer)
 {
-    return create(globalObject, value, WTFMove(transferList), messagePorts, forStorage, SerializationErrorMode::Throwing, serializationContext, forTransfer);
+    return create(globalObject, value, WTF::move(transferList), messagePorts, forStorage, SerializationErrorMode::Throwing, serializationContext, forTransfer);
 }
 
 // ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context)
-ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForTransfer forTransfer)
+ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalObject& lexicalGlobalObject, JSValue value, Vector<JSC::Strong<JSC::JSObject>>&& transferList, Vector<RefPtr<MessagePort>>& messagePorts, SerializationForStorage forStorage, SerializationErrorMode throwExceptions, SerializationContext context, SerializationForCrossProcessTransfer forTransfer)
 {
     VM& vm = lexicalGlobalObject.vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    // Fast path optimization: for postMessage/structuredClone with pure strings and no transfers
+    const bool canUseFastPath = (context == SerializationContext::WorkerPostMessage || context == SerializationContext::WindowPostMessage || context == SerializationContext::Default)
+        && forStorage == SerializationForStorage::No
+        && forTransfer == SerializationForCrossProcessTransfer::No
+        && transferList.isEmpty()
+        && messagePorts.isEmpty();
+
+    if (canUseFastPath) {
+        bool canUseStringFastPath = false;
+        bool canUseObjectFastPath = false;
+        JSObject* object = nullptr;
+        Structure* structure = nullptr;
+        if (value.isCell()) {
+            auto* cell = value.asCell();
+            if (cell->isString()) {
+                canUseStringFastPath = true;
+            } else if (cell->isObject()) {
+                object = cell->getObject();
+                structure = object->structure();
+
+                if (isObjectFastPathCandidate(structure)) {
+                    canUseObjectFastPath = true;
+                }
+            }
+        }
+
+        if (canUseStringFastPath) {
+            JSC::JSString* jsString = asString(value);
+            String stringValue = jsString->value(&lexicalGlobalObject);
+            RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
+            return SerializedScriptValue::createStringFastPath(stringValue);
+        }
+
+        if (canUseObjectFastPath) {
+            ASSERT(object != nullptr);
+
+            WTF::Vector<SimpleInMemoryPropertyTableEntry> properties;
+
+            structure->forEachProperty(vm, [&](const PropertyTableEntry& entry) -> bool {
+                // Only enumerable, data properties
+                if (entry.attributes() & PropertyAttribute::DontEnum) [[unlikely]] {
+                    ASSERT_NOT_REACHED_WITH_MESSAGE("isObjectFastPathCandidate should not allow non-enumerable, data properties");
+                    canUseObjectFastPath = false;
+                    return false;
+                }
+
+                if (entry.attributes() & PropertyAttribute::Accessor) [[unlikely]] {
+                    ASSERT_NOT_REACHED_WITH_MESSAGE("isObjectFastPathCandidate should not allow accessor properties");
+                    canUseObjectFastPath = false;
+                    return false;
+                }
+
+                JSValue value = object->getDirect(entry.offset());
+
+                if (value.isCell()) {
+                    // We only support strings, numbers and primitives. Nothing else.
+                    if (!value.isString()) {
+                        canUseObjectFastPath = false;
+                        return false;
+                    }
+
+                    auto* string = asString(value);
+                    String stringValue = string->value(&lexicalGlobalObject);
+                    if (scope.exception()) {
+                        canUseObjectFastPath = false;
+                        return false;
+                    }
+                    properties.append({ entry.key()->isolatedCopy(), Bun::toCrossThreadShareable(stringValue) });
+                } else {
+                    // Primitive values are safe to share across threads.
+                    properties.append({ entry.key()->isolatedCopy(), value });
+                }
+
+                return true;
+            });
+            RETURN_IF_EXCEPTION(scope, Exception { ExistingExceptionError });
+
+            if (canUseObjectFastPath) {
+                return SerializedScriptValue::createObjectFastPath(WTF::FixedVector<SimpleInMemoryPropertyTableEntry>(WTF::move(properties)));
+            }
+        }
+    }
+
     Vector<RefPtr<JSC::ArrayBuffer>> arrayBuffers;
     // Vector<RefPtr<ImageBitmap>> imageBitmaps;
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
@@ -5775,13 +5947,13 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
                 throwVMTypeError(&lexicalGlobalObject, scope, errorMessageForTransfer(arrayBuffer));
                 RELEASE_AND_RETURN(scope, Exception { ExistingExceptionError });
             }
-            arrayBuffers.append(WTFMove(arrayBuffer));
+            arrayBuffers.append(WTF::move(arrayBuffer));
             continue;
         }
         if (auto port = JSMessagePort::toWrapped(vm, transferable.get())) {
             if (port->isDetached())
                 return Exception { DataCloneError, "MessagePort in transfer list is already detached"_s };
-            messagePorts.append(WTFMove(port));
+            messagePorts.append(WTF::move(port));
             continue;
         }
 
@@ -5791,13 +5963,13 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
         //     if (!imageBitmap->originClean())
         //         return Exception { DataCloneError };
 
-        //     imageBitmaps.append(WTFMove(imageBitmap));
+        //     imageBitmaps.append(WTF::move(imageBitmap));
         //     continue;
         // }
 
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
         if (auto offscreenCanvas = JSOffscreenCanvas::toWrapped(vm, transferable.get())) {
-            offscreenCanvases.append(WTFMove(offscreenCanvas));
+            offscreenCanvases.append(WTF::move(offscreenCanvas));
             continue;
         }
 #endif
@@ -5858,7 +6030,6 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     //         wasmMemoryHandles,
     // #endif
     //         blobHandles, buffer, context, *sharedBuffers, forStorage);
-    auto scope = DECLARE_THROW_SCOPE(vm);
     auto code = CloneSerializer::serialize(&lexicalGlobalObject, value, messagePorts, arrayBuffers,
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
         offscreenCanvases,
@@ -5893,7 +6064,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
         RELEASE_AND_RETURN(scope, arrayBufferContentsArray.releaseException());
     }
 
-    // auto backingStores = ImageBitmap::detachBitmaps(WTFMove(imageBitmaps));
+    // auto backingStores = ImageBitmap::detachBitmaps(WTF::move(imageBitmaps));
 
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
     Vector<std::unique_ptr<DetachedOffscreenCanvas>> detachedCanvases;
@@ -5914,14 +6085,14 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
         videoFrame->close();
 #endif
 
-    //     return adoptRef(*new SerializedScriptValue(WTFMove(buffer), WTFMove(blobHandles), arrayBufferContentsArray.releaseReturnValue(), context == SerializationContext::WorkerPostMessage ? WTFMove(sharedBuffers) : nullptr, WTFMove(backingStores)
+    //     return adoptRef(*new SerializedScriptValue(WTF::move(buffer), WTF::move(blobHandles), arrayBufferContentsArray.releaseReturnValue(), context == SerializationContext::WorkerPostMessage ? WTF::move(sharedBuffers) : nullptr, WTF::move(backingStores)
     // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
     //                                                                                                                                                                                                                                 ,
-    //         WTFMove(detachedCanvases)
+    //         WTF::move(detachedCanvases)
     // #endif
     // #if ENABLE(WEB_RTC)
     //             ,
-    //         WTFMove(detachedRTCDataChannels)
+    //         WTF::move(detachedRTCDataChannels)
     // #endif
     // #if ENABLE(WEBASSEMBLY)
     //             ,
@@ -5929,18 +6100,18 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     // #endif
     // #if ENABLE(WEB_CODECS)
     //         ,
-    //         WTFMove(serializedVideoChunks), WTFMove(serializedVideoFrameData)
+    //         WTF::move(serializedVideoChunks), WTF::move(serializedVideoFrameData)
     // #endif
     //             ));
     scope.releaseAssertNoException();
-    return adoptRef(*new SerializedScriptValue(WTFMove(buffer), arrayBufferContentsArray.releaseReturnValue(), context == SerializationContext::WorkerPostMessage ? WTFMove(sharedBuffers) : nullptr
+    return adoptRef(*new SerializedScriptValue(WTF::move(buffer), arrayBufferContentsArray.releaseReturnValue(), context == SerializationContext::WorkerPostMessage ? WTF::move(sharedBuffers) : nullptr
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
         ,
-        WTFMove(detachedCanvases)
+        WTF::move(detachedCanvases)
 #endif
 #if ENABLE(WEB_RTC)
             ,
-        WTFMove(detachedRTCDataChannels)
+        WTF::move(detachedRTCDataChannels)
 #endif
 #if ENABLE(WEBASSEMBLY)
             ,
@@ -5948,7 +6119,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
 #endif
 #if ENABLE(WEB_CODECS)
         ,
-        WTFMove(serializedVideoChunks), WTFMove(serializedVideoFrameData)
+        WTF::move(serializedVideoChunks), WTF::move(serializedVideoFrameData)
 #endif
             ));
 }
@@ -5958,7 +6129,17 @@ RefPtr<SerializedScriptValue> SerializedScriptValue::create(StringView string)
     Vector<uint8_t> buffer;
     if (!CloneSerializer::serialize(string, buffer))
         return nullptr;
-    return adoptRef(*new SerializedScriptValue(WTFMove(buffer)));
+    return adoptRef(*new SerializedScriptValue(WTF::move(buffer)));
+}
+
+Ref<SerializedScriptValue> SerializedScriptValue::createStringFastPath(const String& string)
+{
+    return adoptRef(*new SerializedScriptValue(Bun::toCrossThreadShareable(string)));
+}
+
+Ref<SerializedScriptValue> SerializedScriptValue::createObjectFastPath(WTF::FixedVector<SimpleInMemoryPropertyTableEntry>&& object)
+{
+    return adoptRef(*new SerializedScriptValue(WTF::move(object)));
 }
 
 RefPtr<SerializedScriptValue> SerializedScriptValue::create(JSContextRef originContext, JSValueRef apiValue, JSValueRef* exception)
@@ -6005,7 +6186,8 @@ Ref<JSC::ArrayBuffer> SerializedScriptValue::toArrayBuffer()
 
 JSC::JSValue SerializedScriptValue::fromArrayBuffer(JSC::JSGlobalObject& domGlobal, JSC::JSGlobalObject* globalObject, JSC::ArrayBuffer* arrayBuffer, size_t byteOffset, size_t maxByteLength, SerializationErrorMode throwExceptions, bool* didFail)
 {
-    auto throwScope = DECLARE_THROW_SCOPE(globalObject->vm());
+    auto& vm = JSC::getVM(globalObject);
+    auto throwScope = DECLARE_THROW_SCOPE(vm);
 
     if (!arrayBuffer || arrayBuffer->isDetached()) {
         if (didFail)
@@ -6035,7 +6217,7 @@ JSC::JSValue SerializedScriptValue::fromArrayBuffer(JSC::JSGlobalObject& domGlob
 #endif
 #if ENABLE(WEB_CODECS)
         ,
-        WTFMove(m_serializedVideoChunks), WTFMove(m_serializedVideoFrames)
+        WTF::move(m_serializedVideoChunks), WTF::move(m_serializedVideoFrames)
 #endif
     );
 
@@ -6046,8 +6228,9 @@ JSC::JSValue SerializedScriptValue::fromArrayBuffer(JSC::JSGlobalObject& domGlob
     if (didFail) {
         *didFail = result.second != SerializationReturnCode::SuccessfullyCompleted;
     }
-    if (throwExceptions == SerializationErrorMode::Throwing)
+    if (throwScope.exception() || throwExceptions == SerializationErrorMode::Throwing) [[unlikely]]
         maybeThrowExceptionIfSerializationFailed(*globalObject, result.second);
+    RETURN_IF_EXCEPTION(throwScope, {});
 
     return result.first ? result.first : jsNull();
 }
@@ -6076,14 +6259,48 @@ JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, 
 {
     VM& vm = lexicalGlobalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
+    switch (m_fastPath) {
+    case FastPath::String:
+        if (didFail)
+            *didFail = false;
+        return jsString(vm, m_fastPathString);
+    case FastPath::SimpleObject: {
+        JSObject* object = constructEmptyObject(globalObject, globalObject->objectPrototype(), std::min(static_cast<unsigned>(m_simpleInMemoryPropertyTable.size()), JSFinalObject::maxInlineCapacity));
+        if (scope.exception()) [[unlikely]] {
+            if (didFail)
+                *didFail = true;
+            return {};
+        }
+
+        for (const auto& property : m_simpleInMemoryPropertyTable) {
+            // We **must** clone this so that the atomic flag doesn't get set to true.
+            JSC::Identifier identifier = JSC::Identifier::fromString(vm, property.propertyName.isolatedCopy());
+            JSValue value = std::visit(
+                WTF::makeVisitor(
+                    [](JSValue value) -> JSValue { return value; },
+                    [&](const String& string) -> JSValue { return jsString(vm, string); }),
+                property.value);
+            object->putDirect(vm, identifier, value);
+        }
+
+        if (didFail)
+            *didFail = false;
+
+        return object;
+    }
+    case FastPath::None: {
+        break;
+    }
+    }
+
     DeserializationResult result = CloneDeserializer::deserialize(&lexicalGlobalObject, globalObject, messagePorts
 #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
         ,
-        WTFMove(m_detachedOffscreenCanvases)
+        WTF::move(m_detachedOffscreenCanvases)
 #endif
 #if ENABLE(WEB_RTC)
             ,
-        WTFMove(m_detachedRTCDataChannels)
+        WTF::move(m_detachedRTCDataChannels)
 #endif
             ,
         m_arrayBufferContentsArray.get(), m_data, blobURLs, blobFilePaths, m_sharedBufferContentsArray.get()
@@ -6093,7 +6310,7 @@ JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, 
 #endif
 #if ENABLE(WEB_CODECS)
                                       ,
-        WTFMove(m_serializedVideoChunks), WTFMove(m_serializedVideoFrames)
+        WTF::move(m_serializedVideoChunks), WTF::move(m_serializedVideoFrames)
 #endif
     );
     if (didFail)
@@ -6110,14 +6327,14 @@ JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, 
 }
 // JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, JSGlobalObject* globalObject, const Vector<String>& blobURLs, const Vector<String>& blobFilePaths, SerializationErrorMode throwExceptions, bool* didFail)
 // {
-//     //     DeserializationResult result = CloneDeserializer::deserialize(&lexicalGlobalObject, globalObject, messagePorts, WTFMove(m_backingStores)
+//     //     DeserializationResult result = CloneDeserializer::deserialize(&lexicalGlobalObject, globalObject, messagePorts, WTF::move(m_backingStores)
 //     // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
 //     //                                                                                                                         ,
-//     //         WTFMove(m_detachedOffscreenCanvases)
+//     //         WTF::move(m_detachedOffscreenCanvases)
 //     // #endif
 //     // #if ENABLE(WEB_RTC)
 //     //             ,
-//     //         WTFMove(m_detachedRTCDataChannels)
+//     //         WTF::move(m_detachedRTCDataChannels)
 //     // #endif
 //     //             ,
 //     //         m_arrayBufferContentsArray.get(), m_data, blobURLs, blobFilePaths, m_sharedBufferContentsArray.get()
@@ -6127,17 +6344,17 @@ JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, 
 //     // #endif
 //     // #if ENABLE(WEB_CODECS)
 //     //                                       ,
-//     //         WTFMove(m_serializedVideoChunks), WTFMove(m_serializedVideoFrames)
+//     //         WTF::move(m_serializedVideoChunks), WTF::move(m_serializedVideoFrames)
 //     // #endif
 //     //     );
 //     DeserializationResult result = CloneDeserializer::deserialize(&lexicalGlobalObject, globalObject
 // #if ENABLE(OFFSCREEN_CANVAS_IN_WORKERS)
 //         ,
-//         WTFMove(m_detachedOffscreenCanvases)
+//         WTF::move(m_detachedOffscreenCanvases)
 // #endif
 // #if ENABLE(WEB_RTC)
 //             ,
-//         WTFMove(m_detachedRTCDataChannels)
+//         WTF::move(m_detachedRTCDataChannels)
 // #endif
 //             ,
 //         m_arrayBufferContentsArray.get(), m_data, blobURLs, blobFilePaths, m_sharedBufferContentsArray.get()
@@ -6147,7 +6364,7 @@ JSValue SerializedScriptValue::deserialize(JSGlobalObject& lexicalGlobalObject, 
 // #endif
 // #if ENABLE(WEB_CODECS)
 //                                       ,
-//         WTFMove(m_serializedVideoChunks), WTFMove(m_serializedVideoFrames)
+//         WTF::move(m_serializedVideoChunks), WTF::move(m_serializedVideoFrames)
 // #endif
 //     );
 //     if (didFail)
@@ -6198,7 +6415,7 @@ uint32_t SerializedScriptValue::wireFormatVersion()
 //     ASSERT(isMainThread());
 //     ASSERT(hasBlobURLs());
 
-//     blobRegistry().writeBlobsToTemporaryFilesForIndexedDB(blobURLs(), [completionHandler = WTFMove(completionHandler), this, protectedThis = Ref { *this }](auto&& blobFilePaths) mutable {
+//     blobRegistry().writeBlobsToTemporaryFilesForIndexedDB(blobURLs(), [completionHandler = WTF::move(completionHandler), this, protectedThis = Ref { *this }](auto&& blobFilePaths) mutable {
 //         ASSERT(isMainThread());
 
 //         if (blobFilePaths.isEmpty()) {

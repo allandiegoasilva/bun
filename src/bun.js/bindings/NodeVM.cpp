@@ -134,7 +134,6 @@ JSC::JSFunction* constructAnonymousFunction(JSC::JSGlobalObject* globalObject, c
             if (actuallyValid) {
                 auto exception = error.toErrorObject(globalObject, sourceCode, -1);
                 RETURN_IF_EXCEPTION(throwScope, nullptr);
-
                 throwException(globalObject, throwScope, exception);
                 return nullptr;
             }
@@ -147,7 +146,7 @@ JSC::JSFunction* constructAnonymousFunction(JSC::JSGlobalObject* globalObject, c
     EXCEPTION_ASSERT(!!throwScope.exception() == code.isNull());
 
     SourceCode sourceCode(
-        JSC::StringSourceProvider::create(code, sourceOrigin, WTFMove(options.filename), sourceTaintOrigin, position, SourceProviderSourceType::Program),
+        JSC::StringSourceProvider::create(code, sourceOrigin, WTF::move(options.filename), sourceTaintOrigin, position, SourceProviderSourceType::Program),
         position.m_line.oneBasedInt(), position.m_column.oneBasedInt());
 
     CodeCache* cache = vm.codeCache();
@@ -317,10 +316,10 @@ static JSInternalPromise* importModuleInner(JSGlobalObject* globalObject, JSStri
 
     RETURN_IF_EXCEPTION(scope, nullptr);
 
-    promise->fulfill(globalObject, result);
+    promise->fulfill(vm, globalObject, result);
     RETURN_IF_EXCEPTION(scope, nullptr);
 
-    promise = promise->then(globalObject, transformer, nullptr);
+    promise = promise->then(globalObject, transformer, globalObject->promiseEmptyOnRejectedFunction());
     RETURN_IF_EXCEPTION(scope, nullptr);
 
     RELEASE_AND_RETURN(scope, promise);
@@ -453,7 +452,8 @@ bool handleException(JSGlobalObject* globalObject, VM& vm, NakedPtr<JSC::Excepti
         }
         auto& stack_frame = e_stack[0];
         auto source_url = stack_frame.sourceURL(vm);
-        if (source_url.isEmpty()) {
+        // Treat empty, [unknown], and [source:*] placeholders as missing source URLs
+        if (source_url.isEmpty() || source_url == "[unknown]"_s || source_url.startsWith("[source:"_s)) {
             // copy what Node does: https://github.com/nodejs/node/blob/afe3909483a2d5ae6b847055f544da40571fb28d/lib/vm.js#L94
             source_url = "evalmachine.<anonymous>"_s;
         }
@@ -611,6 +611,7 @@ NodeVMGlobalObject* getGlobalObjectFromContext(JSGlobalObject* globalObject, JSV
 JSC::EncodedJSValue INVALID_ARG_VALUE_VM_VARIATION(JSC::ThrowScope& throwScope, JSC::JSGlobalObject* globalObject, WTF::ASCIILiteral name, JSC::JSValue value)
 {
     throwScope.throwException(globalObject, createError(globalObject, ErrorCode::ERR_INVALID_ARG_TYPE, makeString("The \""_s, name, "\" argument must be an vm.Context"_s)));
+    throwScope.release();
     return {};
 }
 
@@ -735,6 +736,16 @@ Structure* NodeVMGlobalObject::createStructure(JSC::VM& vm, JSC::JSValue prototy
     return JSC::Structure::create(vm, nullptr, prototype, JSC::TypeInfo(JSC::GlobalObjectType, StructureFlags & ~IsImmutablePrototypeExoticObject), info());
 }
 
+void unsafeEvalNoop(JSGlobalObject*, const WTF::String&) {}
+
+static void promiseRejectionTrackerForNodeVM(JSGlobalObject* globalObject, JSC::JSPromise* promise, JSC::JSPromiseRejectionOperation operation)
+{
+    // Delegate to the parent Zig::GlobalObject so that unhandled rejections
+    // in VM contexts are reported to the main process (matching Node.js behavior)
+    auto* zigGlobalObject = defaultGlobalObject(globalObject);
+    Zig::GlobalObject::promiseRejectionTracker(zigGlobalObject, promise, operation);
+}
+
 const JSC::GlobalObjectMethodTable& NodeVMGlobalObject::globalObjectMethodTable()
 {
     static const JSC::GlobalObjectMethodTable table {
@@ -748,11 +759,11 @@ const JSC::GlobalObjectMethodTable& NodeVMGlobalObject::globalObjectMethodTable(
         nullptr, // moduleLoaderFetch
         nullptr, // moduleLoaderCreateImportMetaProperties
         nullptr, // moduleLoaderEvaluate
-        nullptr, // promiseRejectionTracker
+        &promiseRejectionTrackerForNodeVM,
         &reportUncaughtExceptionAtEventLoop,
         &currentScriptExecutionOwner,
         &scriptExecutionStatus,
-        nullptr, // reportViolationForUnsafeEval
+        &unsafeEvalNoop, // reportViolationForUnsafeEval
         nullptr, // defaultLanguage
         nullptr, // compileStreaming
         nullptr, // instantiateStreaming
@@ -769,7 +780,26 @@ void NodeVMGlobalObject::finishCreation(JSC::VM& vm)
     Base::finishCreation(vm);
     setEvalEnabled(m_contextOptions.allowStrings, "Code generation from strings disallowed for this context"_s);
     setWebAssemblyEnabled(m_contextOptions.allowWasm, "Wasm code generation disallowed by embedder"_s);
+
+    // Delete the internal Loader property from the VM global object.
+    // This is exposed by JSC when exposeInternalModuleLoader() is true,
+    // but it should not be visible in node:vm contexts.
+    JSC::DeletePropertySlot slot;
+    JSC::JSObject::deleteProperty(this, this, vm.propertyNames->Loader, slot);
+
     vm.ensureTerminationException();
+
+    // Share the async context data with the parent Zig::GlobalObject.
+    // This is necessary because AsyncLocalStorage methods (run, getStore, etc.) are defined
+    // in the parent realm and reference the parent's $asyncContext. However, microtask
+    // processing (JSMicrotask.cpp) operates on this NodeVMGlobalObject's m_asyncContextData.
+    // By sharing the same InternalFieldTuple, both the JS code and C++ microtask handling
+    // will operate on the same async context, ensuring proper AsyncLocalStorage behavior
+    // across await boundaries in VM contexts.
+    auto* parentGlobalObject = defaultGlobalObject(this);
+    if (parentGlobalObject && parentGlobalObject->m_asyncContextData) {
+        m_asyncContextData.set(vm, this, parentGlobalObject->m_asyncContextData.get());
+    }
 }
 
 void NodeVMGlobalObject::destroy(JSCell* cell)
@@ -837,14 +867,10 @@ bool NodeVMGlobalObject::put(JSCell* cell, JSGlobalObject* globalObject, Propert
     }
 
     slot.setThisValue(sandbox);
+
     bool result = sandbox->methodTable()->put(sandbox, globalObject, propertyName, value, slot);
     RETURN_IF_EXCEPTION(scope, false);
-
-    if (!result) {
-        return false;
-    }
-
-    RETURN_IF_EXCEPTION(scope, false);
+    if (!result) return false;
 
     if (isDeclaredOnSandbox && getter.isAccessor() and (getter.attributes() & PropertyAttribute::DontEnum) == 0) {
         return true;
@@ -968,9 +994,7 @@ bool NodeVMGlobalObject::getOwnPropertySlot(JSObject* cell, JSGlobalObject* glob
         if (!notContextified) {
             bool result = contextifiedObject->getPropertySlot(globalObject, propertyName, slot);
             RETURN_IF_EXCEPTION(scope, false);
-            if (result) {
-                return true;
-            }
+            if (result) return true;
         }
 
     try_from_global:
@@ -1000,7 +1024,7 @@ bool NodeVMGlobalObject::defineOwnProperty(JSObject* cell, JSGlobalObject* globa
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     auto* thisObject = jsCast<NodeVMGlobalObject*>(cell);
-    if (!thisObject->m_sandbox) {
+    if (!thisObject->m_sandbox) [[likely]] {
         RELEASE_AND_RETURN(scope, Base::defineOwnProperty(cell, globalObject, propertyName, descriptor, shouldThrow));
     }
 
@@ -1016,22 +1040,19 @@ bool NodeVMGlobalObject::defineOwnProperty(JSObject* cell, JSGlobalObject* globa
     }
 
     if (descriptor.isAccessorDescriptor()) {
-        RELEASE_AND_RETURN(scope, JSObject::defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow));
+        RELEASE_AND_RETURN(scope, contextifiedObject->defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow));
     }
 
     bool isDeclaredOnSandbox = contextifiedObject->getPropertySlot(globalObject, propertyName, slot);
     RETURN_IF_EXCEPTION(scope, false);
 
     if (isDeclaredOnSandbox && !isDeclaredOnGlobalProxy) {
-        RELEASE_AND_RETURN(scope, JSObject::defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow));
+        RELEASE_AND_RETURN(scope, contextifiedObject->defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow));
     }
 
-    bool result = JSObject::defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow);
+    auto did = contextifiedObject->defineOwnProperty(contextifiedObject, contextifiedObject->globalObject(), propertyName, descriptor, shouldThrow);
     RETURN_IF_EXCEPTION(scope, false);
-
-    if (!result) {
-        return false;
-    }
+    if (!did) return false;
 
     RELEASE_AND_RETURN(scope, Base::defineOwnProperty(cell, globalObject, propertyName, descriptor, shouldThrow));
 }
@@ -1255,7 +1276,7 @@ JSC_DEFINE_HOST_FUNCTION(vmModuleCompileFunction, (JSGlobalObject * globalObject
     options.parsingContext->setGlobalScopeExtension(functionScope);
 
     // Create the function using constructAnonymousFunction with the appropriate scope chain
-    JSFunction* function = constructAnonymousFunction(globalObject, ArgList(constructFunctionArgs), sourceOrigin, WTFMove(options), JSC::SourceTaintedOrigin::Untainted, functionScope);
+    JSFunction* function = constructAnonymousFunction(globalObject, ArgList(constructFunctionArgs), sourceOrigin, WTF::move(options), JSC::SourceTaintedOrigin::Untainted, functionScope);
     RETURN_IF_EXCEPTION(scope, {});
 
     if (!function) {
@@ -1388,7 +1409,7 @@ static JSInternalPromise* moduleLoaderImportModuleInner(NodeVMGlobalObject* glob
             return NodeVM::importModuleInner(globalObject, moduleName, parameters, sourceOrigin, globalObject->dynamicImportCallback(), JSValue {});
         }
 
-        promise->reject(globalObject, createError(globalObject, ErrorCode::ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING, "A dynamic import callback was not specified."_s));
+        promise->reject(vm, globalObject, createError(globalObject, ErrorCode::ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING, "A dynamic import callback was not specified."_s));
         return promise;
     }
 
@@ -1397,7 +1418,7 @@ static JSInternalPromise* moduleLoaderImportModuleInner(NodeVMGlobalObject* glob
     RETURN_IF_EXCEPTION(scope, promise->rejectWithCaughtException(globalObject, scope));
 
     scope.release();
-    promise->reject(globalObject, createError(globalObject, makeString("Could not import the module '"_s, moduleNameString.data, "'."_s)));
+    promise->reject(vm, globalObject, createError(globalObject, makeString("Could not import the module '"_s, moduleNameString.data, "'."_s)));
     return promise;
 }
 
@@ -1412,14 +1433,13 @@ JSInternalPromise* NodeVMGlobalObject::moduleLoaderImportModule(JSGlobalObject* 
     return moduleLoaderImportModuleInner(nodeVmGlobalObject, moduleLoader, moduleName, parameters, sourceOrigin);
 }
 
-void NodeVMGlobalObject::getOwnPropertyNames(JSObject* cell, JSGlobalObject* globalObject, JSC::PropertyNameArray& propertyNames, JSC::DontEnumPropertiesMode mode)
+void NodeVMGlobalObject::getOwnPropertyNames(JSObject* cell, JSGlobalObject* globalObject, JSC::PropertyNameArrayBuilder& propertyNames, JSC::DontEnumPropertiesMode mode)
 {
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
     auto* thisObject = jsCast<NodeVMGlobalObject*>(cell);
 
-    VM& vm = JSC::getVM(globalObject);
-    auto scope = DECLARE_THROW_SCOPE(vm);
-
-    if (thisObject->m_sandbox) [[likely]] {
+    if (thisObject->m_sandbox) {
         thisObject->m_sandbox->getOwnPropertyNames(thisObject->m_sandbox.get(), globalObject, propertyNames, mode);
         RETURN_IF_EXCEPTION(scope, );
     }
@@ -1553,12 +1573,12 @@ void configureNodeVM(JSC::VM& vm, Zig::GlobalObject* globalObject)
 }
 
 BaseVMOptions::BaseVMOptions(String filename)
-    : filename(WTFMove(filename))
+    : filename(WTF::move(filename))
 {
 }
 
 BaseVMOptions::BaseVMOptions(String filename, OrdinalNumber lineOffset, OrdinalNumber columnOffset)
-    : filename(WTFMove(filename))
+    : filename(WTF::move(filename))
     , lineOffset(lineOffset)
     , columnOffset(columnOffset)
 {

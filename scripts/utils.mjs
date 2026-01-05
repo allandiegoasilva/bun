@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { connect } from "node:net";
 import { hostname, homedir as nodeHomedir, tmpdir as nodeTmpdir, release, userInfo } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { normalize as normalizeWindows } from "node:path/win32";
 
 export const isWindows = process.platform === "win32";
@@ -1370,13 +1370,16 @@ export async function getLastSuccessfulBuild() {
 }
 
 /**
- * @param {string} filename
- * @param {string} [cwd]
+ * @param {string} filename Absolute path to file to upload
  */
-export async function uploadArtifact(filename, cwd) {
+export async function uploadArtifact(filename) {
   if (isBuildkite) {
-    const relativePath = relative(cwd ?? process.cwd(), filename);
-    await spawnSafe(["buildkite-agent", "artifact", "upload", relativePath], { cwd, stdio: "inherit" });
+    await spawnSafe(["buildkite-agent", "artifact", "upload", basename(filename)], {
+      cwd: dirname(filename),
+      stdio: "inherit",
+    });
+  } else {
+    console.warn(`not in buildkite. artifact ${filename} not uploaded.`);
   }
 }
 
@@ -1897,23 +1900,18 @@ export function getUsernameForDistro(distro) {
   if (/windows/i.test(distro)) {
     return "administrator";
   }
-
   if (/alpine|centos/i.test(distro)) {
     return "root";
   }
-
   if (/debian/i.test(distro)) {
     return "admin";
   }
-
   if (/ubuntu/i.test(distro)) {
     return "ubuntu";
   }
-
   if (/amazon|amzn|al\d+|rhel/i.test(distro)) {
     return "ec2-user";
   }
-
   throw new Error(`Unsupported distro: ${distro}`);
 }
 
@@ -2489,7 +2487,7 @@ export function formatAnnotationToHtml(annotation, options = {}) {
  * @param {AnnotationOptions} [options]
  * @returns {AnnotationResult}
  */
-export function parseAnnotations(content, options = {}) {
+export function parseAnnotations(content) {
   /** @type {Annotation[]} */
   const annotations = [];
 
@@ -2699,7 +2697,14 @@ export function reportAnnotationToBuildKite({ context, label, content, style = "
     source: "buildkite",
     level: "error",
   });
-  reportAnnotationToBuildKite({ label: `${label}-error`, content: errorContent, attempt: attempt + 1 });
+  reportAnnotationToBuildKite({
+    context,
+    label: `${label}-error`,
+    content: errorContent,
+    style,
+    priority,
+    attempt: attempt + 1,
+  });
 }
 
 /**
@@ -2798,6 +2803,8 @@ export function endGroup() {
   } else {
     console.groupEnd();
   }
+  // when a file exits with an ASAN error, there is no trailing newline so we add one here to make sure `console.group()` detection doesn't get broken in CI.
+  console.log();
 }
 
 export function printEnvironment() {
@@ -2828,7 +2835,7 @@ export function printEnvironment() {
 
   if (isCI) {
     startGroup("Environment", () => {
-      for (const [key, value] of Object.entries(process.env)) {
+      for (const [key, value] of Object.entries(process.env).toSorted()) {
         console.log(`${key}:`, value);
       }
     });
@@ -2847,11 +2854,33 @@ export function printEnvironment() {
         }
       });
     }
+    if (isLinux) {
+      startGroup("Memory", () => {
+        const shell = which(["sh", "bash"]);
+        if (shell) {
+          spawnSync([shell, "-c", "free -m -w"], { stdio: "inherit" });
+        }
+      });
+      startGroup("Docker", () => {
+        const shell = which(["sh", "bash"]);
+        if (shell) {
+          spawnSync([shell, "-c", "docker ps"], { stdio: "inherit" });
+        }
+      });
+    }
     if (isWindows) {
       startGroup("Disk (win)", () => {
         const shell = which(["pwsh"]);
         if (shell) {
           spawnSync([shell, "-c", "get-psdrive"], { stdio: "inherit" });
+        }
+      });
+      startGroup("Memory", () => {
+        const shell = which(["pwsh"]);
+        if (shell) {
+          spawnSync([shell, "-c", "Get-Counter '\\Memory\\Available MBytes'"], { stdio: "inherit" });
+          console.log();
+          spawnSync([shell, "-c", "Get-CimInstance Win32_PhysicalMemory"], { stdio: "inherit" });
         }
       });
     }
@@ -2950,6 +2979,8 @@ const emojiMap = {
   gear: ["⚙️", "gear"],
   clipboard: ["📋", "clipboard"],
   rocket: ["🚀", "rocket"],
+  openbsd: ["🐡", "openbsd"],
+  netbsd: ["🚩", "netbsd"],
 };
 
 /**

@@ -498,10 +498,9 @@ function emitConvertValue(
         if (decl === "declare") {
           cpp.line(`${type.cppName()} ${storageLocation};`);
         }
-        cpp.line(`if (!convert${type.cppInternalName()}(&${storageLocation}, global, ${jsValueRef}))`);
-        cpp.indent();
-        cpp.line(`return {};`);
-        cpp.dedent();
+        cpp.line(`auto did_convert = convert${type.cppInternalName()}(&${storageLocation}, global, ${jsValueRef});`);
+        cpp.line(`RETURN_IF_EXCEPTION(throwScope, {});`);
+        cpp.line(`if (!did_convert) return {};`);
         break;
       }
       default:
@@ -755,11 +754,13 @@ function emitConvertEnumFunction(w: CodeWriter, type: TypeImpl) {
   w.line();
   w.line(`template<> std::optional<${name}> parseEnumerationFromString<${name}>(const String& stringValue)`);
   w.line(`{`);
-  w.line(`    static constexpr std::pair<ComparableASCIILiteral, ${name}> mappings[] = {`);
+  w.line(
+    `    static constexpr std::array<std::pair<ComparableASCIILiteral, ${name}>, ${type.data.length}> mappings { {`,
+  );
   for (const value of type.data) {
     w.line(`        { ${str(value)}_s, ${name}::${pascal(value)} },`);
   }
-  w.line(`    };`);
+  w.line(`    } };`);
   w.line(`    static constexpr SortedArrayMap enumerationMapping { mappings };`);
   w.line(`    if (auto* enumerationValue = enumerationMapping.tryGet(stringValue); enumerationValue) [[likely]]`);
   w.line(`        return *enumerationValue;`);
@@ -805,7 +806,7 @@ function zigTypeNameInner(type: TypeImpl): string {
       return "usize";
     case "globalObject":
     case "zigVirtualMachine":
-      return "*JSC.JSGlobalObject";
+      return "*jsc.JSGlobalObject";
     default:
       const cAbiType = type.canDirectlyMapToCAbi();
       if (cAbiType) {
@@ -838,7 +839,7 @@ function returnStrategyZigType(strategy: ReturnStrategy): string {
     case "void":
       return "bool"; // true=success, false=exception
     case "jsvalue":
-      return "JSC.JSValue";
+      return "jsc.JSValue";
     default:
       throw new Error(
         `TODO: returnStrategyZigType for ${Bun.inspect(strategy satisfies never, { colors: Bun.enableANSIColors })}`,
@@ -1017,7 +1018,9 @@ function emitCppVariationSelector(fn: Func, namespaceVar: string) {
     }
 
     if (variants.length === 1) {
-      cpp.line(`return ${extInternalDispatchVariant(namespaceVar, fn.name, variants[0].suffix)}(global, callFrame);`);
+      cpp.line(
+        `RELEASE_AND_RETURN(throwScope, ${extInternalDispatchVariant(namespaceVar, fn.name, variants[0].suffix)}(global, callFrame));`,
+      );
     } else {
       let argIndex = 0;
       let strategies: DistinguishStrategy[] | null = null;
@@ -1053,7 +1056,9 @@ function emitCppVariationSelector(fn: Func, namespaceVar: string) {
         const { condition, canThrow } = getDistinguishCode(s, arg.type, "distinguishingValue");
         cpp.line(`if (${condition}) {`);
         cpp.indent();
-        cpp.line(`return ${extInternalDispatchVariant(namespaceVar, fn.name, v.suffix)}(global, callFrame);`);
+        cpp.line(
+          `RELEASE_AND_RETURN(throwScope, ${extInternalDispatchVariant(namespaceVar, fn.name, v.suffix)}(global, callFrame));`,
+        );
         cpp.dedent();
         cpp.line(`}`);
         if (canThrow) {
@@ -1126,8 +1131,8 @@ const cppInternal = new CodeWriter();
 const headers = new Set<string>();
 
 zig.line('const bun = @import("bun");');
-zig.line("const JSC = bun.JSC;");
-zig.line("const JSHostFunctionType = JSC.JSHostFn;\n");
+zig.line("const jsc = bun.jsc;");
+zig.line("const JSHostFunctionType = jsc.JSHostFn;\n");
 
 zigInternal.line("const binding_internals = struct {");
 zigInternal.indent();
@@ -1305,7 +1310,7 @@ for (const [filename, { functions, typedefs }] of files) {
 
       let globalObjectArg = "";
       if (vari.globalObjectArg === "hidden") {
-        args.push(`global: *JSC.JSGlobalObject`);
+        args.push(`global: *jsc.JSGlobalObject`);
         globalObjectArg = "global";
       }
       let argNum = 0;
@@ -1363,7 +1368,7 @@ for (const [filename, { functions, typedefs }] of files) {
 
       switch (returnStrategy.type) {
         case "jsvalue":
-          zigInternal.add(`return JSC.toJSHostCall(${globalObjectArg}, @src(), `);
+          zigInternal.add(`return jsc.toJSHostCall(${globalObjectArg}, @src(), `);
           break;
         case "basic-out-param":
           zigInternal.add(`out.* = @as(bun.JSError!${returnStrategy.abiType}, `);
@@ -1433,6 +1438,7 @@ for (const [filename, { functions, typedefs }] of files) {
           zigInternal.line(`)) catch |err| switch (err) {`);
           zigInternal.line(`    error.JSError => return false,`);
           zigInternal.line(`    error.OutOfMemory => ${globalObjectArg}.throwOutOfMemory() catch return false,`);
+          zigInternal.line(`    error.JSTerminated => return false,`);
           zigInternal.line(`};`);
           zigInternal.line(`return true;`);
           break;
@@ -1449,9 +1455,9 @@ for (const [filename, { functions, typedefs }] of files) {
     // Wrapper to init JSValue
     const wrapperName = zid("create" + cap(fn.name) + "Callback");
     const minArgCount = fn.variants.reduce((acc, vari) => Math.min(acc, vari.args.length), Number.MAX_SAFE_INTEGER);
-    zig.line(`pub fn ${wrapperName}(global: *JSC.JSGlobalObject) callconv(JSC.conv) JSC.JSValue {`);
+    zig.line(`pub fn ${wrapperName}(global: *jsc.JSGlobalObject) callconv(jsc.conv) jsc.JSValue {`);
     zig.line(
-      `    return JSC.host_fn.NewRuntimeFunction(global, JSC.ZigString.static(${str(fn.name)}), ${minArgCount}, js${cap(fn.name)}, false, false, null);`,
+      `    return jsc.host_fn.NewRuntimeFunction(global, jsc.ZigString.static(${str(fn.name)}), ${minArgCount}, js${cap(fn.name)}, false, null);`,
     );
     zig.line(`}`);
   }
